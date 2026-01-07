@@ -649,7 +649,7 @@ if __name__ == "__main__":
         # --- CUSTOM TOURNAMENT CONFIGURATION ---
         # 32916 = Spring Bot Maker Tournament 2026
         # Placeholder for market-pulse-26q1 (Update this ID when known)
-        CUSTOM_TOURNAMENT_IDS = [32916] 
+        CUSTOM_TOURNAMENT_IDS = ["32916", "ACX2026", "market-pulse-26q1", "metaculus-cup-spring-2026"] 
         
         logger.info(f"Forecasting on Tournaments: {CUSTOM_TOURNAMENT_IDS}")
         
