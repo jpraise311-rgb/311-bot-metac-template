@@ -6,48 +6,51 @@ import dotenv
 from typing import Literal
 import os
 
-from forecasting_tools import (
-    AskNewsSearcher,
-    BinaryQuestion,
-    ForecastBot,
-    GeneralLlm,
-    MetaculusClient,
-    MetaculusQuestion,
-    MultipleChoiceQuestion,
-    NumericDistribution,
-    NumericQuestion,
-    DateQuestion,
-    DatePercentile,
-    Percentile,
-    ConditionalQuestion,
-    ConditionalPrediction,
-    PredictionTypes,
-    PredictionAffirmed,
-    BinaryPrediction,
-    PredictedOptionList,
-    ReasonedPrediction,
-    SmartSearcher,
-    clean_indents,
-    structure_output,
-)
+# Try importing forecasting_tools; handle missing installation gracefully
+try:
+    from forecasting_tools import (
+        AskNewsSearcher,
+        BinaryQuestion,
+        ForecastBot,
+        GeneralLlm,
+        MetaculusClient,
+        MetaculusQuestion,
+        MultipleChoiceQuestion,
+        NumericDistribution,
+        NumericQuestion,
+        DateQuestion,
+        DatePercentile,
+        Percentile,
+        ConditionalQuestion,
+        ConditionalPrediction,
+        PredictionTypes,
+        PredictionAffirmed,
+        BinaryPrediction,
+        PredictedOptionList,
+        ReasonedPrediction,
+        SmartSearcher,
+        clean_indents,
+        structure_output,
+    )
+except ImportError:
+    print("❌ Critical Error: 'forecasting_tools' not found.")
+    print("Please install it via pip: pip install forecasting-tools")
+    exit(1)
 
+# Load environment variables from .env file
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 # --- CONFIGURATION FOR FREE OPENROUTER ---
-# We use a generic free model identifier here. 
-# Ensure you have OPENROUTER_API_KEY set in your environment.
 FREE_MODEL_STRING = "openrouter/google/gemini-2.0-flash-exp:free" 
 
 class SpringTemplateBot2026(ForecastBot):
     """
     This is the template bot for Spring 2026 Metaculus AI Tournament.
-    Updated to use Free OpenRouter AI and AskNews/Linkup search.
+    Updated to use Free OpenRouter AI and Auto-Detect Search (AskNews/Linkup).
     """
 
-    _max_concurrent_questions = (
-        1  # Set this to whatever works for your search-provider/ai-model rate limits
-    )
+    _max_concurrent_questions = 1
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
@@ -75,39 +78,54 @@ class SpringTemplateBot2026(ForecastBot):
                 """
             )
 
-            if isinstance(researcher, GeneralLlm):
-                research = await researcher.invoke(prompt)
-            elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
-            ):
-                # Uses AskNews as requested
-                research = await AskNewsSearcher().call_preconfigured_version(
-                    researcher, prompt
-                )
-            elif researcher.startswith("smart-searcher"):
-                # Extracts the LLM model name from the string (e.g. "smart-searcher/gpt-4o")
-                model_name = researcher.removeprefix("smart-searcher/")
+            try:
+                if isinstance(researcher, GeneralLlm):
+                    research = await researcher.invoke(prompt)
                 
-                # SmartSearcher will typically use the environment's search provider (e.g. Linkup if LINKUP_API_KEY is present)
-                # driven by the model specified here.
-                searcher = SmartSearcher(
-                    model=model_name,
-                    temperature=0,
-                    num_searches_to_run=2,
-                    num_sites_per_search=10,
-                    use_advanced_filters=False,
-                )
-                research = await searcher.invoke(prompt)
-            elif not researcher or researcher == "None" or researcher == "no_research":
-                research = ""
-            else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
-            
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
+                elif (
+                    researcher == "asknews/news-summaries"
+                    or researcher == "asknews/deep-research/low-depth"
+                    or researcher == "asknews/deep-research/medium-depth"
+                    or researcher == "asknews/deep-research/high-depth"
+                ):
+                    # Check for keys before crashing
+                    if not (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) and not os.getenv("ASKNEWS_API_KEY"):
+                        logger.warning(f"⚠️ Skipping AskNews research for {question.page_url}: Missing credentials in .env")
+                        return "Research unavailable: Missing AskNews credentials."
+
+                    research = await AskNewsSearcher().call_preconfigured_version(
+                        researcher, prompt
+                    )
+                
+                elif researcher.startswith("smart-searcher"):
+                    # Check for Linkup key if implicitly used by SmartSearcher
+                    if not os.getenv("LINKUP_API_KEY") and not os.getenv("SERPAPI_API_KEY"):
+                         logger.warning(f"⚠️ SmartSearcher may fail: No LINKUP_API_KEY or SERPAPI_API_KEY found.")
+
+                    model_name = researcher.removeprefix("smart-searcher/")
+                    searcher = SmartSearcher(
+                        model=model_name,
+                        temperature=0,
+                        num_searches_to_run=2,
+                        num_sites_per_search=10,
+                        use_advanced_filters=False,
+                    )
+                    research = await searcher.invoke(prompt)
+                
+                elif not researcher or researcher == "None" or researcher == "no_research":
+                    research = ""
+                else:
+                    research = await self.get_llm("researcher", "llm").invoke(prompt)
+                
+                logger.info(f"Found Research for URL {question.page_url} ({len(research)} chars)")
+                return research
+
+            except ValueError as e:
+                logger.error(f"❌ Configuration Error during research for {question.page_url}: {e}")
+                return "Research failed due to configuration error (likely missing API keys)."
+            except Exception as e:
+                logger.error(f"❌ General Error during research for {question.page_url}: {e}")
+                return "Research failed due to an unexpected error."
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -157,7 +175,6 @@ class SpringTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[float]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
             BinaryPrediction,
@@ -231,7 +248,6 @@ class SpringTemplateBot2026(ForecastBot):
             """
         )
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning,
             output_type=PredictedOptionList,
@@ -314,7 +330,6 @@ class SpringTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a numeric question.
@@ -408,7 +423,6 @@ class SpringTemplateBot2026(ForecastBot):
         prompt: str,
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self.get_llm("default", "llm").invoke(prompt)
-        logger.info(f"Reasoning for URL {question.page_url}: {reasoning}")
         parsing_instructions = clean_indents(
             f"""
             The text given to you is trying to give a forecast distribution for a date question.
@@ -520,7 +534,6 @@ class SpringTemplateBot2026(ForecastBot):
             and previous_forecasts
             and question_type not in self.force_reforecast_in_conditional
         ):
-            # TODO: add option to not affirm current parent/child forecasts, create new forecast
             previous_forecast = previous_forecasts[-1]
             current_utc_time = datetime.now(timezone.utc)
             if (
@@ -595,31 +608,39 @@ if __name__ == "__main__":
         default="tournament",
         help="Specify the run mode (default: tournament)",
     )
-    # ADDED ARGUMENT to switch providers
+    # ADDED ARGUMENT to switch providers manually if needed
     parser.add_argument(
         "--search-provider",
         type=str,
-        choices=["asknews", "linkup"],
-        default="asknews",
-        help="Specify the search provider (default: asknews). 'linkup' requires LINKUP_API_KEY.",
+        choices=["auto", "asknews", "linkup"],
+        default="auto",
+        help="Specify the search provider. 'auto' detects based on API keys present.",
     )
     
     args = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
-    search_provider: Literal["asknews", "linkup"] = args.search_provider
+    
+    # --- AUTO-DETECT PROVIDER LOGIC ---
+    provider = args.search_provider
+    if provider == "auto":
+        has_asknews = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv("ASKNEWS_API_KEY")
+        has_linkup = os.getenv("LINKUP_API_KEY")
+        
+        if has_linkup and not has_asknews:
+            provider = "linkup"
+            logger.info("Auto-detected Linkup key. Switching provider to Linkup.")
+        else:
+            provider = "asknews" # Default
+            if not has_asknews:
+                logger.warning("⚠️ No Search API keys found (AskNews or Linkup). Research will likely fail.")
 
     # Determine researcher string based on provider
-    if search_provider == "linkup":
-        # Uses SmartSearcher with the free model. 
-        # SmartSearcher typically looks for LINKUP_API_KEY if no specific tool is forced,
-        # or defaults to standard search if not present.
+    if provider == "linkup":
         researcher_config = f"smart-searcher/{FREE_MODEL_STRING}"
-        logger.info("Using SmartSearcher (Linkup/Standard). Ensure LINKUP_API_KEY is set for Linkup.")
     else:
-        # Default AskNews
         researcher_config = "asknews/news-summaries"
 
-    # Initialize Bot with Free OpenRouter configuration and dynamic researcher
+    # Initialize Bot
     template_bot = SpringTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=3, 
@@ -629,12 +650,7 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
         llms={
-            "default": GeneralLlm(
-                model=FREE_MODEL_STRING, 
-                temperature=0.3,
-                timeout=50,
-                allowed_tries=3,
-            ),
+            "default": GeneralLlm(model=FREE_MODEL_STRING, temperature=0.3, timeout=50, allowed_tries=3),
             "summarizer": FREE_MODEL_STRING,
             "researcher": researcher_config, 
             "parser": FREE_MODEL_STRING,
@@ -647,15 +663,20 @@ if __name__ == "__main__":
 
     if run_mode == "tournament":
         # --- CUSTOM TOURNAMENT CONFIGURATION ---
-        # 32916 = Spring Bot Maker Tournament 2026
-        # Placeholder for market-pulse-26q1 (Update this ID when known)
-        CUSTOM_TOURNAMENT_IDS = ["32916", "ACX2026", "market-pulse-26q1", "metaculus-cup-spring-2026"] 
+        # Includes all the tournaments you requested
+        CUSTOM_TOURNAMENT_IDS = [
+            32916, # Spring Bot Maker 2026
+            "ACX2026", 
+            "market-pulse-26q1", 
+            "metaculus-cup-spring-2026"
+        ]
         
         logger.info(f"Forecasting on Tournaments: {CUSTOM_TOURNAMENT_IDS}")
         
         all_reports = []
         for tournament_id in CUSTOM_TOURNAMENT_IDS:
             try:
+                # The client can handle both int and string (slug) IDs
                 reports = asyncio.run(
                     template_bot.forecast_on_tournament(
                         tournament_id, return_exceptions=True
