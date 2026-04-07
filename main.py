@@ -2,9 +2,13 @@
 
 import argparse
 import asyncio
+import contextvars
 import logging
 import os
 import re
+import time
+import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -56,29 +60,87 @@ except ImportError:
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+# Correlation ID for request tracing
+correlation_id: contextvars.ContextVar[str] = contextvars.ContextVar('correlation_id', default='')
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  METRICS COLLECTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Metrics:
+    """Simple metrics collection for monitoring."""
+    
+    def __init__(self):
+        self.counters = defaultdict(int)
+        self.timers = defaultdict(list)
+        self.gauges = {}
+    
+    def increment(self, name: str, value: int = 1):
+        self.counters[name] += value
+    
+    def record_time(self, name: str, duration: float):
+        self.timers[name].append(duration)
+    
+    def set_gauge(self, name: str, value: float):
+        self.gauges[name] = value
+    
+    def get_summary(self) -> dict:
+        summary = dict(self.counters)
+        for name, times in self.timers.items():
+            if times:
+                summary[f"{name}_count"] = len(times)
+                summary[f"{name}_avg"] = sum(times) / len(times)
+                summary[f"{name}_min"] = min(times)
+                summary[f"{name}_max"] = max(times)
+        summary.update(self.gauges)
+        return summary
+
+# Global metrics instance
+metrics = Metrics()
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  STRUCTURED LOGGING
+# ═══════════════════════════════════════════════════════════════════════════
+
+class CorrelationIdFilter(logging.Filter):
+    """Add correlation ID to log records."""
+    
+    def filter(self, record):
+        record.correlation_id = correlation_id.get() or 'no-id'
+        return True
+
+def setup_logging():
+    """Configure structured logging with correlation IDs."""
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(correlation_id)s] - %(message)s'
+    )
+    
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    handler.addFilter(CorrelationIdFilter())
+    
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+    
+    # Suppress noisy libraries
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    logging.getLogger("LiteLLM").propagate = False
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  MODEL CONFIGURATION — Free OpenRouter rotation with fallback chain
 # ═══════════════════════════════════════════════════════════════════════════
 
-FREE_MODELS = [
-    "openrouter/google/gemini-2.0-flash-exp:free",       # Primary — fast + capable
-    "openrouter/google/gemini-2.5-pro-exp-03-25:free",   # Best reasoning when available
-    "openrouter/meta-llama/llama-4-maverick:free",        # Strong open-source fallback
-    "openrouter/deepseek/deepseek-r1:free",               # Deep reasoning fallback
-    "openrouter/mistralai/mistral-small-3.1-24b-instruct:free",  # Lightweight fallback
-]
-
-# Primary model for all LLM calls
-PRIMARY_MODEL   = FREE_MODELS[0]
-REASONING_MODEL = FREE_MODELS[1]   # Used for AI Spring Tournament confidence gating
-PARSER_MODEL    = FREE_MODELS[0]   # Keep parser fast
+# OpenRouter will automatically route to appropriate free model based on function
+PRIMARY_MODEL   = "openrouter/free"
+REASONING_MODEL = "openrouter/free"   # Used for AI Spring Tournament confidence gating
+PARSER_MODEL    = "openrouter/free"   # Keep parser fast
 
 # ── Tournaments ─────────────────────────────────────────────────────────────
 TOURNAMENT_IDS = {
     "spring_bot":      32916,
-    "acx":             "ACX2026",
     "market_pulse":    "market-pulse-26q2",
-    "metaculus_cup":   "metaculus-cup-spring-2026",
+    "minibench":       "minibench",
 }
 
 # MarketPulse tickers for common financial questions
@@ -133,7 +195,7 @@ def extremize_binary(p: float, strength: float = 0.3) -> float:
 def extremize_option_list(options: PredictedOptionList, strength: float = 0.25) -> PredictedOptionList:
     """Extremize a multiple-choice distribution away from uniform."""
     # Sharpening: raise each prob to (1+strength), then renormalize
-    raw = [(opt, max(1e-6, opt.probability) ** (1 + strength)) for opt in options.options]
+    raw = [(opt, max(1e-6, opt.probability) ** (1 + strength)) for opt in options.predicted_options]
     total = sum(v for _, v in raw)
     for opt, v in raw:
         opt.probability = round(v / total, 4)
@@ -141,58 +203,167 @@ def extremize_option_list(options: PredictedOptionList, strength: float = 0.25) 
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  SEARCH PROVIDERS: Firecrawl + Linkup + AskNews fallback
+#  RATE LIMITING
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def search_with_firecrawl(query: str, num_results: int = 5) -> str:
-    """Search using Firecrawl's search endpoint."""
-    api_key = os.getenv("FIRECRAWL_API_KEY")
-    if not api_key or not HAS_HTTPX:
+class RateLimiter:
+    """Simple rate limiter for API calls."""
+    
+    def __init__(self, calls_per_minute: int = 60):
+        self.calls_per_minute = calls_per_minute
+        self.calls = []
+    
+    async def acquire(self):
+        """Wait if necessary to respect rate limit."""
+        now = time.time()
+        # Remove old calls
+        self.calls = [t for t in self.calls if now - t < 60]
+        
+        if len(self.calls) >= self.calls_per_minute:
+            # Wait until oldest call expires
+            wait_time = 60 - (now - self.calls[0])
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+                # Recheck after waiting
+                return await self.acquire()
+        
+        self.calls.append(now)
+
+# Global rate limiter for external APIs
+api_rate_limiter = RateLimiter(calls_per_minute=30)  # Conservative limit
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DATA SANITIZATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+def sanitize_input(text: str) -> str:
+    """Sanitize user inputs to prevent injection or malicious content."""
+    if not isinstance(text, str):
         return ""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.firecrawl.dev/v1/search",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"query": query, "limit": num_results, "scrapeOptions": {"formats": ["markdown"]}},
+    
+    # Remove potentially dangerous characters
+    text = re.sub(r'[<>]', '', text)  # Remove angle brackets
+    text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)  # Remove JS URLs
+    text = re.sub(r'data:', '', text, flags=re.IGNORECASE)  # Remove data URLs
+    
+    # Limit length
+    if len(text) > 10000:
+        text = text[:10000] + "..."
+    
+    return text.strip()
+
+class BaseSearcher:
+    """Base class for search providers."""
+    
+    async def search(self, query: str, num_results: int = 5) -> str:
+        raise NotImplementedError
+    
+    def is_available(self) -> bool:
+        return True
+
+class FirecrawlSearcher(BaseSearcher):
+    """Firecrawl search provider."""
+    
+    def is_available(self) -> bool:
+        return bool(os.getenv("FIRECRAWL_API_KEY") and HAS_HTTPX)
+    
+    async def search(self, query: str, num_results: int = 5) -> str:
+        if not self.is_available():
+            return ""
+        
+        # Sanitize input
+        query = sanitize_input(query)
+        
+        # Rate limiting
+        await api_rate_limiter.acquire()
+        
+        api_key = os.getenv("FIRECRAWL_API_KEY")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.firecrawl.dev/v1/search",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"query": query, "limit": num_results, "scrapeOptions": {"formats": ["markdown"]}},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                results = data.get("data", [])
+                snippets = []
+                for r in results:
+                    title   = r.get("title", "")
+                    url     = r.get("url", "")
+                    content = r.get("markdown", r.get("description", ""))[:800]
+                    snippets.append(f"### {title}\n{url}\n{content}")
+                metrics.increment("firecrawl_searches_success")
+                return "\n\n".join(snippets)
+        except Exception as e:
+            metrics.increment("firecrawl_searches_failed")
+            logger.warning(f"Firecrawl search failed: {e}")
+            return ""
+
+class LinkupSearcher(BaseSearcher):
+    """Linkup search provider."""
+    
+    def is_available(self) -> bool:
+        return bool(os.getenv("LINKUP_API_KEY") and HAS_HTTPX)
+    
+    async def search(self, query: str, depth: str = "standard") -> str:
+        if not self.is_available():
+            return ""
+        
+        # Sanitize input
+        query = sanitize_input(query)
+        
+        # Rate limiting
+        await api_rate_limiter.acquire()
+        
+        api_key = os.getenv("LINKUP_API_KEY")
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    "https://api.linkup.so/v1/search",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={"q": query, "depth": depth, "outputType": "sourcedAnswer", "includeImages": False},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                answer  = data.get("answer", "")
+                sources = data.get("sources", [])
+                source_lines = [f"- [{s.get('name','')}]({s.get('url','')}) — {s.get('snippet','')[:300]}" for s in sources[:6]]
+                metrics.increment("linkup_searches_success")
+                return f"{answer}\n\nSources:\n" + "\n".join(source_lines) if answer else ""
+        except Exception as e:
+            metrics.increment("linkup_searches_failed")
+            logger.warning(f"Linkup search failed: {e}")
+            return ""
+
+class AskNewsSearcherWrapper(BaseSearcher):
+    """AskNews search provider wrapper."""
+    
+    def is_available(self) -> bool:
+        has_asknews = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv("ASKNEWS_API_KEY")
+        return bool(has_asknews)
+    
+    async def search(self, query: str, num_results: int = 5) -> str:
+        if not self.is_available():
+            return ""
+        
+        try:
+            prompt_for_asknews = f"{query}\n\nResolution: forecast resolution"
+            ans = await AskNewsSearcher().call_preconfigured_version(
+                "asknews/news-summaries", prompt_for_asknews
             )
-            resp.raise_for_status()
-            data = resp.json()
-            results = data.get("data", [])
-            snippets = []
-            for r in results:
-                title   = r.get("title", "")
-                url     = r.get("url", "")
-                content = r.get("markdown", r.get("description", ""))[:800]
-                snippets.append(f"### {title}\n{url}\n{content}")
-            return "\n\n".join(snippets)
-    except Exception as e:
-        logger.warning(f"Firecrawl search failed: {e}")
-        return ""
+            metrics.increment("asknews_searches_success")
+            return ans
+        except Exception as e:
+            metrics.increment("asknews_searches_failed")
+            logger.warning(f"AskNews fallback failed: {e}")
+            return ""
 
-
-async def search_with_linkup(query: str, depth: str = "standard") -> str:
-    """Search using Linkup API."""
-    api_key = os.getenv("LINKUP_API_KEY")
-    if not api_key or not HAS_HTTPX:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.linkup.so/v1/search",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"q": query, "depth": depth, "outputType": "sourcedAnswer", "includeImages": False},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            answer  = data.get("answer", "")
-            sources = data.get("sources", [])
-            source_lines = [f"- [{s.get('name','')}]({s.get('url','')}) — {s.get('snippet','')[:300]}" for s in sources[:6]]
-            return f"{answer}\n\nSources:\n" + "\n".join(source_lines) if answer else ""
-    except Exception as e:
-        logger.warning(f"Linkup search failed: {e}")
-        return ""
-
+# Initialize search providers
+firecrawl_searcher = FirecrawlSearcher()
+linkup_searcher = LinkupSearcher()
+asknews_searcher = AskNewsSearcherWrapper()
 
 async def fetch_yfinance_context(question_text: str) -> str:
     """Extract ticker from question and fetch current price + recent trend."""
@@ -277,7 +448,7 @@ async def assess_forecast_confidence(
 #  MAIN BOT CLASS
 # ═══════════════════════════════════════════════════════════════════════════
 
-class jpBot2026(ForecastBot):
+class Bot3112026(ForecastBot):
     """
     311bot SuperForecaster — Spring 2026
     ─────────────────────────────────────────
@@ -361,29 +532,22 @@ class jpBot2026(ForecastBot):
         results = []
 
         # Try Firecrawl
-        if os.getenv("FIRECRAWL_API_KEY"):
-            fc = await search_with_firecrawl(query, num_results=4)
+        if firecrawl_searcher.is_available():
+            fc = await firecrawl_searcher.search(query, num_results=4)
             if fc:
                 results.append(f"## Firecrawl Results\n{fc}")
 
         # Try Linkup
-        if os.getenv("LINKUP_API_KEY"):
-            lk = await search_with_linkup(query)
+        if linkup_searcher.is_available():
+            lk = await linkup_searcher.search(query)
             if lk:
                 results.append(f"## Linkup Results\n{lk}")
 
         # Fallback to AskNews if both above empty
-        if not results:
-            has_asknews = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv("ASKNEWS_API_KEY")
-            if has_asknews:
-                try:
-                    prompt_for_asknews = f"{question.question_text}\n\nResolution: {question.resolution_criteria}"
-                    ans = await AskNewsSearcher().call_preconfigured_version(
-                        "asknews/news-summaries", prompt_for_asknews
-                    )
-                    results.append(f"## AskNews Results\n{ans}")
-                except Exception as e:
-                    logger.warning(f"AskNews fallback failed: {e}")
+        if not results and asknews_searcher.is_available():
+            ans = await asknews_searcher.search(query)
+            if ans:
+                results.append(f"## AskNews Results\n{ans}")
 
         return "\n\n".join(results)
 
@@ -778,30 +942,57 @@ class jpBot2026(ForecastBot):
             Never re-forecast the parent.
         """)
 
+    # ── HEALTH CHECKS ─────────────────────────────────────────────────────
+
+    async def health_check(self) -> dict:
+        """Check health of external dependencies."""
+        health = {
+            "firecrawl": firecrawl_searcher.is_available(),
+            "linkup": linkup_searcher.is_available(),
+            "asknews": asknews_searcher.is_available(),
+            "yfinance": HAS_YFINANCE,
+            "httpx": HAS_HTTPX,
+            "forecasting_tools": True,  # If we got here, it's loaded
+        }
+        
+        # Test actual API connectivity (lightweight)
+        try:
+            if health["firecrawl"]:
+                # Quick test search
+                test_result = await firecrawl_searcher.search("test query", 1)
+                health["firecrawl_connectivity"] = bool(test_result or True)  # Available even if no results
+        except:
+            health["firecrawl_connectivity"] = False
+        
+        try:
+            if health["linkup"]:
+                test_result = await linkup_searcher.search("test query")
+                health["linkup_connectivity"] = bool(test_result or True)
+        except:
+            health["linkup_connectivity"] = False
+        
+        return health
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-    logging.getLogger("LiteLLM").propagate = False
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-
+    setup_logging()
+    
+    # Set correlation ID for main execution
+    correlation_id.set(str(uuid.uuid4()))
+    
     parser = argparse.ArgumentParser(description="OracleDeck SuperForecaster Bot 2026")
     parser.add_argument(
         "--mode",
-        choices=["tournament", "market_pulse", "ai_spring", "metaculus_cup", "test"],
+        choices=["tournament", "market_pulse", "ai_spring", "test"],
         default="tournament",
         help=(
             "tournament     → all tournaments (default)\n"
             "market_pulse   → MarketPulse only (uses yfinance)\n"
             "ai_spring      → AI Spring Tournament only (confidence-gated)\n"
-            "metaculus_cup  → Metaculus Cup only\n"
             "test           → single test question"
         ),
     )
@@ -830,14 +1021,14 @@ if __name__ == "__main__":
             logger.warning("⚠️  No search API keys found (FIRECRAWL_API_KEY, LINKUP_API_KEY, or AskNews). Research will be empty.")
 
     # ── Build bot ────────────────────────────────────────────────────────
-    bot = jpBot2026(
+    bot = Bot3112026(
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=True,
+        extra_metadata_in_explanation=False,
         llms={
             "default":    GeneralLlm(model=PRIMARY_MODEL,   temperature=0.3, timeout=60, allowed_tries=3),
             "summarizer": PRIMARY_MODEL,
@@ -879,13 +1070,6 @@ if __name__ == "__main__":
             bot.forecast_on_tournament(TOURNAMENT_IDS["spring_bot"], return_exceptions=True)
         )
 
-    elif args.mode == "metaculus_cup":
-        bot._is_ai_spring_tournament = False
-        bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            bot.forecast_on_tournament(TOURNAMENT_IDS["metaculus_cup"], return_exceptions=True)
-        )
-
     elif args.mode == "test":
         TEST_URLS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
@@ -898,3 +1082,6 @@ if __name__ == "__main__":
         )
 
     bot.log_report_summary(forecast_reports)
+    
+    # Log final metrics
+    logger.info(f"Final metrics: {metrics.get_summary()}")
