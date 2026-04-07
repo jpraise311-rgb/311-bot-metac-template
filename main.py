@@ -133,9 +133,9 @@ def setup_logging():
 
 # Using OpenRouter's current available free tier models
 # Format for LiteLLM: "openrouter/{provider}/{model}:free"
-PRIMARY_MODEL   = "openrouter/openrouter:free"                             # Primary — auto-routed free model
+PRIMARY_MODEL   = "openrouter/openrouter/free"                             # Primary — auto-routed free model
 REASONING_MODEL = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"      # Best for analysis
-PARSER_MODEL    = "openrouter/qwen/qwen3-coder:free"                       # Structured output parsing
+PARSER_MODEL    = "openrouter/openrouter/free"                       # Structured output parsing
 
 # ── Tournaments ─────────────────────────────────────────────────────────────
 TOURNAMENT_IDS = {
