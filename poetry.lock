@@ -1869,6 +1869,17 @@ docs = ["intersphinx-registry", "myst-parser", "pydata-sphinx-theme", "sphinx-au
 test = ["ipykernel", "pre-commit", "pytest (<9)", "pytest-cov", "pytest-timeout"]
 
 [[package]]
+name = "linkup"
+version = "0.1.4"
+description = "Making mappings operable."
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "linkup-0.1.4.tar.gz", hash = "sha256:60c25d6f075f82a5b248f7e28ab2d41a50075150874204d24566e4903b231379"},
+]
+
+[[package]]
 name = "litellm"
 version = "1.83.4"
 description = "Library to easily interface with LLM API providers"
@@ -4939,4 +4950,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "2aef72d78b02328f859d2afb454e517970fb4ada9e8484f9984e8c61d728123d"
+content-hash = "91d0c0afc02d9f1d129773ec62ab5a277c71c79638126afe1267942409b9452b"
