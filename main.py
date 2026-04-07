@@ -135,7 +135,7 @@ def setup_logging():
 # Format for LiteLLM: "openrouter/{provider}/{model}:free"
 PRIMARY_MODEL   = "openrouter/openrouter/free"                             # Primary — auto-routed free model
 REASONING_MODEL = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"      # Best for analysis
-PARSER_MODEL    = "openrouter/openrouter/free"                       # Structured output parsing
+PARSER_MODEL    = "openrouter/openai/gpt-oss-20b:free"                     # Structured output parsing
 
 # ── Tournaments ─────────────────────────────────────────────────────────────
 TOURNAMENT_IDS = {
@@ -231,7 +231,7 @@ class RateLimiter:
         self.calls.append(now)
 
 # Global rate limiter for external APIs
-api_rate_limiter = RateLimiter(calls_per_minute=30)  # Conservative limit
+api_rate_limiter = RateLimiter(calls_per_minute=18)  # OpenRouter free tier limit is 20/min, use 18 for safety
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  DATA SANITIZATION
