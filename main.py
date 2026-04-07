@@ -128,13 +128,14 @@ def setup_logging():
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MODEL CONFIGURATION — Free OpenRouter rotation with fallback chain
+#  MODEL CONFIGURATION — Free OpenRouter models
 # ═══════════════════════════════════════════════════════════════════════════
 
-# OpenRouter will automatically route to appropriate free model based on function
-PRIMARY_MODEL   = "openrouter/free"
-REASONING_MODEL = "openrouter/free"   # Used for AI Spring Tournament confidence gating
-PARSER_MODEL    = "openrouter/free"   # Keep parser fast
+# Using OpenRouter's current available free tier models
+# These are automatically rotated by OpenRouter based on availability
+PRIMARY_MODEL   = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"      # Primary — capable reasoning
+REASONING_MODEL = "openrouter/qwen/qwen3.6-plus:free"                      # Best for analysis
+PARSER_MODEL    = "openrouter/qwen/qwen3-coder:free"                       # Structured output parsing
 
 # ── Tournaments ─────────────────────────────────────────────────────────────
 TOURNAMENT_IDS = {
