@@ -77,7 +77,7 @@ PARSER_MODEL    = FREE_MODELS[0]   # Keep parser fast
 TOURNAMENT_IDS = {
     "spring_bot":      32916,
     "acx":             "ACX2026",
-    "market_pulse":    "market-pulse-26q1",
+    "market_pulse":    "market-pulse-26q2",
     "metaculus_cup":   "metaculus-cup-spring-2026",
 }
 
@@ -277,7 +277,7 @@ async def assess_forecast_confidence(
 #  MAIN BOT CLASS
 # ═══════════════════════════════════════════════════════════════════════════
 
-class 311Bot2026(ForecastBot):
+class jpBot2026(ForecastBot):
     """
     311bot SuperForecaster — Spring 2026
     ─────────────────────────────────────────
@@ -830,7 +830,7 @@ if __name__ == "__main__":
             logger.warning("⚠️  No search API keys found (FIRECRAWL_API_KEY, LINKUP_API_KEY, or AskNews). Research will be empty.")
 
     # ── Build bot ────────────────────────────────────────────────────────
-    bot = 311Bot2026(
+    bot = jpBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
