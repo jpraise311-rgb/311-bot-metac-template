@@ -151,6 +151,7 @@ FORECAST_33022_ID = 33022
 TOURNAMENT_IDS = {
     "spring_bot":      32916,
     "market_pulse":    "market-pulse-26q2",
+    "t":               "market-pulse-26q2",
     "minibench":       "minibench",
     "forecast_33022":  33022,
 }
