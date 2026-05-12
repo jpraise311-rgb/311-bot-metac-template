@@ -132,10 +132,11 @@ def setup_logging():
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Using OpenRouter's current available free tier models
-# Format for LiteLLM: "openrouter/{provider}/{model}:free"
-PRIMARY_MODEL   = "openrouter/openrouter/free"                             # Primary — auto-routed free model
+# Format for LiteLLM: "openrouter/free" for the generic free model,
+# or "{provider}/{model}:free" for a provider-specific free model.
+PRIMARY_MODEL   = "openrouter/free"                                       # Primary — generic free model
 REASONING_MODEL = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"      # Best for analysis
-PARSER_MODEL    = "openrouter/openai/gpt-oss-20b:free"                     # Structured output parsing
+PARSER_MODEL    = "openrouter/free"                                       # Structured output parsing (generic free model)
 
 FORECAST_MODELS = [
     "openrouter/elephant-alpha",
