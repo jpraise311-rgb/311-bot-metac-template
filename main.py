@@ -120,7 +120,7 @@ def setup_logging():
     handler.addFilter(CorrelationIdFilter())
     
     logging.getLogger().addHandler(handler)
-    logging.getLogger().setLevel(logging.INFO)
+    logging.getLogger().setLevel(logging.DEBUG)
     
     # Suppress noisy libraries
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
@@ -387,7 +387,7 @@ class PerplexitySonarSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "openrouter/perplexity/sonar",
+                    "model": "perplexity/sonar",
                     "messages": [
                         {
                             "role": "user",
@@ -397,6 +397,11 @@ class PerplexitySonarSearcher(BaseSearcher):
                     "temperature": 0.2,
                     "max_tokens": 1500,
                 }
+                
+                # Debug log: mask the API key in the payload copy
+                debug_payload = dict(payload)
+                debug_payload_str = str(debug_payload).replace(api_key, "***MASKED***")
+                logger.debug(f"Perplexity Sonar request payload: {debug_payload_str}")
                 
                 resp = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -415,6 +420,10 @@ class PerplexitySonarSearcher(BaseSearcher):
                     metrics.increment("perplexity_sonar_success")
                     return f"## Perplexity Sonar Search Results\n{content}"
                 return ""
+        except httpx.HTTPStatusError as e:
+            metrics.increment("perplexity_sonar_failed")
+            logger.error(f"Perplexity Sonar HTTP {e.response.status_code}: {e.response.text}")
+            return ""
         except Exception as e:
             metrics.increment("perplexity_sonar_failed")
             logger.warning(f"Perplexity Sonar search failed: {e}")
@@ -437,7 +446,7 @@ class PerplexitySonarProSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "openrouter/perplexity/sonar-pro-search",
+                    "model": "perplexity/sonar-pro-search",
                     "messages": [
                         {
                             "role": "user",
@@ -447,6 +456,11 @@ class PerplexitySonarProSearcher(BaseSearcher):
                     "temperature": 0.2,
                     "max_tokens": 1500,
                 }
+                
+                # Debug log: mask the API key in the payload copy
+                debug_payload = dict(payload)
+                debug_payload_str = str(debug_payload).replace(api_key, "***MASKED***")
+                logger.debug(f"Perplexity Sonar Pro Search request payload: {debug_payload_str}")
                 
                 resp = await client.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -465,6 +479,10 @@ class PerplexitySonarProSearcher(BaseSearcher):
                     metrics.increment("perplexity_sonar_pro_search_success")
                     return f"## Perplexity Sonar Pro Search Results\n{content}"
                 return ""
+        except httpx.HTTPStatusError as e:
+            metrics.increment("perplexity_sonar_pro_search_failed")
+            logger.error(f"Perplexity Sonar Pro Search HTTP {e.response.status_code}: {e.response.text}")
+            return ""
         except Exception as e:
             metrics.increment("perplexity_sonar_pro_search_failed")
             logger.warning(f"Perplexity Sonar Pro search failed: {e}")
