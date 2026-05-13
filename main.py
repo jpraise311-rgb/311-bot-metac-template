@@ -132,14 +132,14 @@ def setup_logging():
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Using OpenRouter Perplexity models for all forecasting, reasoning, and parsing.
-PRIMARY_MODEL   = "openrouter/perplexity/sonar-pro-chat"                 # Primary forecasting model
-REASONING_MODEL = "openrouter/perplexity/sonar-pro"                      # Confidence & reasoning model
-PARSER_MODEL    = "openrouter/perplexity/sonar-mini"                     # Structured output parser
+PRIMARY_MODEL   = "openrouter/perplexity/sonar"                          # Lightweight, fast Q&A with citations
+REASONING_MODEL = "openrouter/perplexity/sonar-reasoning-pro"            # Deep reasoning with chain of thought and wide context
+PARSER_MODEL    = "openrouter/perplexity/sonar"                          # Fast structured output parser
 
 FORECAST_MODELS = [
+    "openrouter/perplexity/sonar",
     "openrouter/perplexity/sonar-pro",
-    "openrouter/perplexity/sonar-pro-chat",
-    "openrouter/perplexity/sonar-mini",
+    "openrouter/perplexity/sonar-deep-research",
 ]
 
 FORECAST_33022_ID = 33022
@@ -370,8 +370,8 @@ class AskNewsSearcherWrapper(BaseSearcher):
             logger.warning(f"AskNews fallback failed: {e}")
             return ""
 
-class OpenAISearchPreviewSearcher(BaseSearcher):
-    """OpenAI GPT-4o mini with search preview via OpenRouter."""
+class PerplexitySonarSearcher(BaseSearcher):
+    """Perplexity Sonar via OpenRouter — lightweight, fast, citation-rich Q&A search."""
     
     def is_available(self) -> bool:
         return bool(os.getenv("OPENROUTER_API_KEY") and HAS_HTTPX)
@@ -387,11 +387,11 @@ class OpenAISearchPreviewSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "openrouter/openai/gpt-4o-mini-search-preview",
+                    "model": "openrouter/perplexity/sonar",
                     "messages": [
                         {
                             "role": "user",
-                            "content": f"Search the web for information to help answer this question for forecasting purposes: {query}\n\nProvide a brief research summary with key facts and sources."
+                            "content": f"Search the web and provide concise, citation-rich research to help forecast this question: {query}\n\nInclude key facts, recent developments, and relevant sources."
                         }
                     ],
                     "temperature": 0.2,
@@ -412,16 +412,16 @@ class OpenAISearchPreviewSearcher(BaseSearcher):
                 data = resp.json()
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if content:
-                    metrics.increment("openai_search_preview_success")
-                    return f"## OpenAI GPT-4o mini Search Results\n{content}"
+                    metrics.increment("perplexity_sonar_success")
+                    return f"## Perplexity Sonar Search Results\n{content}"
                 return ""
         except Exception as e:
-            metrics.increment("openai_search_preview_failed")
-            logger.warning(f"OpenAI search preview failed: {e}")
+            metrics.increment("perplexity_sonar_failed")
+            logger.warning(f"Perplexity Sonar search failed: {e}")
             return ""
 
 class PerplexitySonarProSearcher(BaseSearcher):
-    """Perplexity Sonar Pro with search via OpenRouter."""
+    """Perplexity Sonar Pro Search via OpenRouter — agentic research workflows."""
     
     def is_available(self) -> bool:
         return bool(os.getenv("OPENROUTER_API_KEY") and HAS_HTTPX)
@@ -462,11 +462,11 @@ class PerplexitySonarProSearcher(BaseSearcher):
                 data = resp.json()
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 if content:
-                    metrics.increment("perplexity_sonar_search_success")
+                    metrics.increment("perplexity_sonar_pro_search_success")
                     return f"## Perplexity Sonar Pro Search Results\n{content}"
                 return ""
         except Exception as e:
-            metrics.increment("perplexity_sonar_search_failed")
+            metrics.increment("perplexity_sonar_pro_search_failed")
             logger.warning(f"Perplexity Sonar Pro search failed: {e}")
             return ""
 
@@ -474,8 +474,8 @@ class PerplexitySonarProSearcher(BaseSearcher):
 firecrawl_searcher = FirecrawlSearcher()
 linkup_searcher = LinkupSearcher()
 asknews_searcher = AskNewsSearcherWrapper()
-openai_search_preview_searcher = OpenAISearchPreviewSearcher()
-perplexity_sonar_searcher = PerplexitySonarProSearcher()
+perplexity_sonar_searcher = PerplexitySonarSearcher()
+perplexity_sonar_pro_searcher = PerplexitySonarProSearcher()
 
 async def fetch_yfinance_context(question_text: str) -> str:
     """Extract ticker from question and fetch current price + recent trend."""
@@ -687,13 +687,13 @@ class Bot3112026(ForecastBot):
         if asknews_searcher.is_available():
             search_tasks.append(asknews_searcher.search(query))
         
-        # Add OpenAI Search Preview (parallel async)
-        if openai_search_preview_searcher.is_available():
-            search_tasks.append(openai_search_preview_searcher.search(query))
-        
-        # Add Perplexity Sonar Pro (parallel async)
+        # Add Perplexity Sonar (parallel async)
         if perplexity_sonar_searcher.is_available():
             search_tasks.append(perplexity_sonar_searcher.search(query))
+        
+        # Add Perplexity Sonar Pro Search (parallel async)
+        if perplexity_sonar_pro_searcher.is_available():
+            search_tasks.append(perplexity_sonar_pro_searcher.search(query))
         
         # Run all searches in parallel
         if search_tasks:
@@ -1107,8 +1107,8 @@ class Bot3112026(ForecastBot):
             "firecrawl": firecrawl_searcher.is_available(),
             "linkup": linkup_searcher.is_available(),
             "asknews": asknews_searcher.is_available(),
-            "openai_search_preview": openai_search_preview_searcher.is_available(),
-            "perplexity_sonar_pro": perplexity_sonar_searcher.is_available(),
+            "perplexity_sonar": perplexity_sonar_searcher.is_available(),
+            "perplexity_sonar_pro_search": perplexity_sonar_pro_searcher.is_available(),
             "yfinance": HAS_YFINANCE,
             "httpx": HAS_HTTPX,
             "forecasting_tools": True,  # If we got here, it's loaded
@@ -1185,7 +1185,7 @@ if __name__ == "__main__":
         logger.warning("⚠️  No search API keys found (FIRECRAWL_API_KEY, LINKUP_API_KEY, ASKNEWS, or OPENROUTER_API_KEY). Research will be empty.")
     
     if has_openrouter:
-        logger.info("✓ OpenRouter search models (GPT-4o mini search, Perplexity Sonar Pro) available and will run async in parallel")
+        logger.info("✓ OpenRouter Perplexity search models (sonar, sonar-pro-search) available and will run async in parallel")
 
 
     # ── Build bot ────────────────────────────────────────────────────────
