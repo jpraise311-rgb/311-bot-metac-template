@@ -711,21 +711,16 @@ class Bot3112026(ForecastBot):
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
 
-        # ── AI Spring Tournament confidence gate ──────────────────────────
+        # ── AI Spring Tournament confidence check ─────────────────────────
         if self._is_ai_spring_tournament:
             reasoning_llm = GeneralLlm(
                 model=REASONING_MODEL, temperature=0.1, timeout=60, allowed_tries=2
             )
             confidence = await assess_forecast_confidence(question, research, reasoning_llm)
-            if confidence < self.AI_SPRING_CONFIDENCE_THRESHOLD:
-                logger.info(
-                    f"🚫 Skipping {question.page_url} — confidence {confidence:.0%} "
-                    f"< threshold {self.AI_SPRING_CONFIDENCE_THRESHOLD:.0%}"
-                )
-                return ReasonedPrediction(
-                    prediction_value=0.5,
-                    reasoning=f"[SKIPPED — low confidence: {confidence:.0%}. No submission made.]",
-                )
+            logger.info(
+                f"AI Spring confidence for {question.page_url}: {confidence:.0%} "
+                f"(threshold {self.AI_SPRING_CONFIDENCE_THRESHOLD:.0%})"
+            )
 
         prompt = clean_indents(f"""
             You are a professional superforecaster.
