@@ -305,7 +305,7 @@ def call_perplexity(question: str) -> str:
         "content-type": "application/json",
     }
     payload = {
-        "model": "llama-3.1-sonar-huge-128k-online",
+        "model": "perplexity/sonar",
         "messages": [
             {
                 "role": "system",  # this is a system prompt designed to guide the perplexity assistant
