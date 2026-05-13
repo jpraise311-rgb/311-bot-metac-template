@@ -758,7 +758,7 @@ class Bot3112026(ForecastBot):
         strength = self._get_extremization_strength()
         ext_p = extremize_binary(raw_p, strength=strength)
         if self._should_force_hard_extreme():
-            ext_p = 0.99 if raw_p >= 0.5 else 0.01
+            ext_p = 0.99 if raw_p >= 0.5 else 0.003
         if abs(ext_p - raw_p) > 0.01:
             logger.info(f"Extremized {raw_p:.2%} → {ext_p:.2%} for {question.page_url}")
         result.prediction_value = ext_p
