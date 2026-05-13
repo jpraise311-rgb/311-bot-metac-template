@@ -387,7 +387,7 @@ class PerplexitySonarSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "openrouter/perplexity/sonar",
+                    "model": "perplexity/sonar",
                     "messages": [
                         {
                             "role": "user",
@@ -396,7 +396,7 @@ class PerplexitySonarSearcher(BaseSearcher):
                     ],
                     "temperature": 0.2,
                     "max_tokens": 1500,
-                    "extra_body": {"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
+                    "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
                 }
                 
                 # Debug log: mask the API key in the payload copy
@@ -447,7 +447,7 @@ class PerplexitySonarProSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "openrouter/perplexity/sonar-pro",
+                    "model": "perplexity/sonar-pro-search",
                     "messages": [
                         {
                             "role": "user",
@@ -456,7 +456,7 @@ class PerplexitySonarProSearcher(BaseSearcher):
                     ],
                     "temperature": 0.2,
                     "max_tokens": 1500,
-                    "extra_body": {"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
+                    "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
                 }
                 
                 # Debug log: mask the API key in the payload copy
@@ -484,9 +484,9 @@ class PerplexitySonarProSearcher(BaseSearcher):
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 # Fallback to sonar-pro if sonar-pro-search not available
-                logger.warning("sonar-pro model not available, falling back to sonar")
+                logger.warning("sonar-pro-search model not available, falling back to sonar-pro")
                 try:
-                    payload["model"] = "openrouter/perplexity/sonar"
+                    payload["model"] = "perplexity/sonar-pro"
                     resp = await client.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={
