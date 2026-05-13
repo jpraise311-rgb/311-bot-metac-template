@@ -133,7 +133,7 @@ def setup_logging():
 
 # Using OpenRouter Perplexity models for all forecasting, reasoning, and parsing.
 PRIMARY_MODEL   = "openrouter/perplexity/sonar"                          # Lightweight, fast Q&A with citations
-REASONING_MODEL = "openrouter/perplexity/sonar-reasoning-pro"            # Deep reasoning with chain of thought and wide context
+REASONING_MODEL = "openrouter/perplexity/sonar-reasoning"                # Deep reasoning with chain of thought and wide context
 PARSER_MODEL    = "openrouter/perplexity/sonar"                          # Fast structured output parser
 
 FORECAST_MODELS = [
@@ -387,7 +387,7 @@ class PerplexitySonarSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "perplexity/sonar",
+                    "model": "openrouter/perplexity/sonar",
                     "messages": [
                         {
                             "role": "user",
@@ -396,6 +396,7 @@ class PerplexitySonarSearcher(BaseSearcher):
                     ],
                     "temperature": 0.2,
                     "max_tokens": 1500,
+                    "extra_body": {"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
                 }
                 
                 # Debug log: mask the API key in the payload copy
@@ -446,7 +447,7 @@ class PerplexitySonarProSearcher(BaseSearcher):
         try:
             async with httpx.AsyncClient(timeout=30) as client:
                 payload = {
-                    "model": "perplexity/sonar-pro-search",
+                    "model": "openrouter/perplexity/sonar-pro",
                     "messages": [
                         {
                             "role": "user",
@@ -455,6 +456,7 @@ class PerplexitySonarProSearcher(BaseSearcher):
                     ],
                     "temperature": 0.2,
                     "max_tokens": 1500,
+                    "extra_body": {"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
                 }
                 
                 # Debug log: mask the API key in the payload copy
@@ -480,6 +482,32 @@ class PerplexitySonarProSearcher(BaseSearcher):
                     return f"## Perplexity Sonar Pro Search Results\n{content}"
                 return ""
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                # Fallback to sonar-pro if sonar-pro-search not available
+                logger.warning("sonar-pro model not available, falling back to sonar")
+                try:
+                    payload["model"] = "openrouter/perplexity/sonar"
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                            "HTTP-Referer": "https://metaculus.com",
+                            "X-Title": "Metaculus Forecasting Bot",
+                        },
+                        json=payload,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if content:
+                        metrics.increment("perplexity_sonar_pro_search_success")
+                        return f"## Perplexity Sonar Search Results (fallback)\n{content}"
+                    return ""
+                except Exception as fallback_e:
+                    logger.warning(f"Perplexity Sonar fallback search failed: {fallback_e}")
+                    metrics.increment("perplexity_sonar_pro_search_failed")
+                    return ""
             metrics.increment("perplexity_sonar_pro_search_failed")
             logger.error(f"Perplexity Sonar Pro Search HTTP {e.response.status_code}: {e.response.text}")
             return ""
@@ -606,7 +634,13 @@ class Bot3112026(ForecastBot):
 
     def _get_forecaster_llms(self) -> list[GeneralLlm]:
         return [
-            GeneralLlm(model=model_name, temperature=0.28, timeout=60, allowed_tries=2)
+            GeneralLlm(
+                model=model_name, 
+                temperature=0.28, 
+                timeout=60, 
+                allowed_tries=2,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+            )
             for model_name in FORECAST_MODELS
         ]
 
@@ -732,7 +766,11 @@ class Bot3112026(ForecastBot):
         # ── AI Spring Tournament confidence check ─────────────────────────
         if self._is_ai_spring_tournament:
             reasoning_llm = GeneralLlm(
-                model=REASONING_MODEL, temperature=0.1, timeout=60, allowed_tries=2
+                model=REASONING_MODEL, 
+                temperature=0.1, 
+                timeout=60, 
+                allowed_tries=2,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
             )
             confidence = await assess_forecast_confidence(question, research, reasoning_llm)
             logger.info(
@@ -1198,7 +1236,7 @@ if __name__ == "__main__":
         logger.warning("⚠️  No search API keys found (FIRECRAWL_API_KEY, LINKUP_API_KEY, ASKNEWS, or OPENROUTER_API_KEY). Research will be empty.")
     
     if has_openrouter:
-        logger.info("✓ OpenRouter Perplexity search models (sonar, sonar-pro-search) available and will run async in parallel")
+        logger.info("✓ OpenRouter Perplexity search models (sonar, sonar-pro) available and will run async in parallel")
 
 
     # ── Build bot ────────────────────────────────────────────────────────
@@ -1211,10 +1249,34 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=False,
         llms={
-            "default":    GeneralLlm(model=PRIMARY_MODEL,   temperature=0.3, timeout=60, allowed_tries=3),
-            "summarizer": PRIMARY_MODEL,
-            "researcher": PRIMARY_MODEL,
-            "parser":     GeneralLlm(model=PARSER_MODEL,    temperature=0.0, timeout=45, allowed_tries=3),
+            "default":    GeneralLlm(
+                model=PRIMARY_MODEL,   
+                temperature=0.3, 
+                timeout=60, 
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+            ),
+            "summarizer": GeneralLlm(
+                model=PRIMARY_MODEL,   
+                temperature=0.3, 
+                timeout=60, 
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+            ),
+            "researcher": GeneralLlm(
+                model=PRIMARY_MODEL,   
+                temperature=0.3, 
+                timeout=60, 
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+            ),
+            "parser":     GeneralLlm(
+                model=PARSER_MODEL,    
+                temperature=0.0, 
+                timeout=45, 
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+            ),
         },
     )
 
