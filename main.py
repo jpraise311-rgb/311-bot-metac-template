@@ -596,7 +596,7 @@ class Bot3112026(ForecastBot):
         if self._current_tournament_id == FORECAST_33022_ID:
             return 2.3
         if self._current_tournament_key == "minibench":
-            return 4.5
+            return 4.6
         return self.BINARY_EXTREMIZE_STRENGTH
 
     def _should_force_hard_extreme(self) -> bool:
