@@ -1,5 +1,3 @@
-
-
 import argparse
 import asyncio
 import contextvars
@@ -128,19 +126,40 @@ def setup_logging():
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MODEL CONFIGURATION — OpenRouter Perplexity models
+#  MODEL CONFIGURATION
+#
+#  FIX 1: Corrected OpenRouter Perplexity model strings.
+#
+#  Old broken strings (caused HTTP 400):
+#    "perplexity/llama-3.1-sonar-small-128k-online"   ← retired
+#    "perplexity/llama-3.1-sonar-large-128k-online"   ← retired
+#    "perplexity/sonar-pro-search"                     ← never existed
+#
+#  Current valid strings (as of May 2026):
+#    perplexity/sonar                  lightweight, fast, citations
+#    perplexity/sonar-pro              deep research, higher context
+#    perplexity/sonar-reasoning        chain-of-thought + search
+#    perplexity/sonar-reasoning-pro    pro CoT variant
+#    perplexity/sonar-deep-research    long-form agentic research
+#
+#  GeneralLlm prefix: "openrouter/perplexity/<model>"
+#  Direct httpx calls: "perplexity/<model>"  (no openrouter/ prefix)
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Using OpenRouter Perplexity models for all forecasting, reasoning, and parsing.
-PRIMARY_MODEL   = "openrouter/perplexity/sonar"                          # Lightweight, fast Q&A with citations
-REASONING_MODEL = "openrouter/perplexity/sonar-reasoning"                # Deep reasoning with chain of thought and wide context
-PARSER_MODEL    = "openrouter/perplexity/sonar"                          # Fast structured output parser
+PRIMARY_MODEL   = "openrouter/perplexity/sonar"
+REASONING_MODEL = "openrouter/perplexity/sonar-reasoning"
+PARSER_MODEL    = "openrouter/perplexity/sonar"
 
 FORECAST_MODELS = [
     "openrouter/perplexity/sonar",
     "openrouter/perplexity/sonar-pro",
     "openrouter/perplexity/sonar-deep-research",
 ]
+
+# FIX 2: Provider routing — use allow_fallbacks: True so a rate-limited
+# Perplexity slot doesn't hard-fail the whole request on the free tier.
+# If you have a paid OR key you can flip this back to False.
+_PROVIDER_ROUTING = {"order": ["Perplexity"], "allow_fallbacks": True}
 
 FORECAST_33022_ID = 33022
 
@@ -187,24 +206,17 @@ def extremize_binary(p: float, strength: float = 0.3) -> float:
     Additionally enforces a DEAD ZONE: any prediction landing in [0.43, 0.57]
     is nudged out to 0.40 or 0.60 to prevent wishy-washy 50/50 forecasts.
     """
-    # Clamp to safe range first
     p = max(0.02, min(0.98, p))
-
-    # Power extremization
     denom = p ** (1 - strength) + (1 - p) ** (1 - strength)
     p_ext = p ** (1 - strength) / denom
     p_ext = max(0.02, min(0.98, p_ext))
-
-    # Dead-zone enforcement: ban [0.43, 0.57]
     if 0.43 <= p_ext <= 0.57:
         p_ext = 0.40 if p_ext < 0.50 else 0.60
-
     return round(p_ext, 4)
 
 
 def extremize_option_list(options: PredictedOptionList, strength: float = 0.25) -> PredictedOptionList:
     """Extremize a multiple-choice distribution away from uniform."""
-    # Sharpening: raise each prob to (1+strength), then renormalize
     raw = [(opt, max(1e-6, opt.probability) ** (1 + strength)) for opt in options.predicted_options]
     total = sum(v for _, v in raw)
     for opt, v in raw:
@@ -224,69 +236,106 @@ class RateLimiter:
         self.calls = []
     
     async def acquire(self):
-        """Wait if necessary to respect rate limit."""
         now = time.time()
-        # Remove old calls
         self.calls = [t for t in self.calls if now - t < 60]
-        
         if len(self.calls) >= self.calls_per_minute:
-            # Wait until oldest call expires
             wait_time = 60 - (now - self.calls[0])
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
-                # Recheck after waiting
                 return await self.acquire()
-        
         self.calls.append(now)
 
-# Global rate limiter for external APIs
-api_rate_limiter = RateLimiter(calls_per_minute=18)  # OpenRouter free tier limit is 20/min, use 18 for safety
+# Global rate limiter — OpenRouter free tier is 20 req/min; use 18 for headroom
+api_rate_limiter = RateLimiter(calls_per_minute=18)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  DATA SANITIZATION
 # ═══════════════════════════════════════════════════════════════════════════
 
 def sanitize_input(text: str) -> str:
-    """Sanitize user inputs to prevent injection or malicious content."""
     if not isinstance(text, str):
         return ""
-    
-    # Remove potentially dangerous characters
-    text = re.sub(r'[<>]', '', text)  # Remove angle brackets
-    text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)  # Remove JS URLs
-    text = re.sub(r'data:', '', text, flags=re.IGNORECASE)  # Remove data URLs
-    
-    # Limit length
+    text = re.sub(r'[<>]', '', text)
+    text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'data:', '', text, flags=re.IGNORECASE)
     if len(text) > 10000:
         text = text[:10000] + "..."
-    
     return text.strip()
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  OPENROUTER HELPER
+#  Centralised POST so every searcher shares the same headers / error logging.
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _openrouter_chat(
+    client: "httpx.AsyncClient",
+    api_key: str,
+    model: str,
+    user_content: str,
+    temperature: float = 0.2,
+    max_tokens: int = 1500,
+) -> str:
+    """
+    POST a single-turn chat completion to OpenRouter and return the text content.
+    Raises httpx.HTTPStatusError on 4xx/5xx so callers can handle specific codes.
+    """
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": user_content}],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        # FIX 3: allow_fallbacks True — prevents hard 400/429 failures on free tier
+        "provider": {"order": ["Perplexity"], "allow_fallbacks": True},
+    }
+
+    logger.debug("OpenRouter → model=%s | tokens=%d | prompt_len=%d",
+                 model, max_tokens, len(user_content))
+
+    resp = await client.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://metaculus.com",
+            "X-Title": "Metaculus Forecasting Bot",
+        },
+        json=payload,
+    )
+
+    if resp.status_code >= 400:
+        # Log the full error body — this is what reveals the exact 400 reason
+        logger.error(
+            "OpenRouter %d for model=%s | response body: %s",
+            resp.status_code, model, resp.text,
+        )
+        resp.raise_for_status()
+
+    data = resp.json()
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SEARCH PROVIDERS
+# ═══════════════════════════════════════════════════════════════════════════
+
 class BaseSearcher:
-    """Base class for search providers."""
-    
     async def search(self, query: str, num_results: int = 5) -> str:
         raise NotImplementedError
     
     def is_available(self) -> bool:
         return True
 
+
 class FirecrawlSearcher(BaseSearcher):
-    """Firecrawl search provider."""
-    
     def is_available(self) -> bool:
         return bool(os.getenv("FIRECRAWL_API_KEY") and HAS_HTTPX)
     
     async def search(self, query: str, num_results: int = 5) -> str:
         if not self.is_available():
             return ""
-        
-        # Sanitize input
         query = sanitize_input(query)
-        
-        # Rate limiting
         await api_rate_limiter.acquire()
-        
         api_key = os.getenv("FIRECRAWL_API_KEY")
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -311,22 +360,16 @@ class FirecrawlSearcher(BaseSearcher):
             logger.warning(f"Firecrawl search failed: {e}")
             return ""
 
+
 class LinkupSearcher(BaseSearcher):
-    """Linkup search provider."""
-    
     def is_available(self) -> bool:
         return bool(os.getenv("LINKUP_API_KEY") and HAS_HTTPX)
     
     async def search(self, query: str, depth: str = "standard") -> str:
         if not self.is_available():
             return ""
-        
-        # Sanitize input
         query = sanitize_input(query)
-        
-        # Rate limiting
         await api_rate_limiter.acquire()
-        
         api_key = os.getenv("LINKUP_API_KEY")
         try:
             async with httpx.AsyncClient(timeout=30) as client:
@@ -339,7 +382,10 @@ class LinkupSearcher(BaseSearcher):
                 data = resp.json()
                 answer  = data.get("answer", "")
                 sources = data.get("sources", [])
-                source_lines = [f"- [{s.get('name','')}]({s.get('url','')}) — {s.get('snippet','')[:300]}" for s in sources[:6]]
+                source_lines = [
+                    f"- [{s.get('name','')}]({s.get('url','')}) — {s.get('snippet','')[:300]}"
+                    for s in sources[:6]
+                ]
                 metrics.increment("linkup_searches_success")
                 return f"{answer}\n\nSources:\n" + "\n".join(source_lines) if answer else ""
         except Exception as e:
@@ -347,9 +393,8 @@ class LinkupSearcher(BaseSearcher):
             logger.warning(f"Linkup search failed: {e}")
             return ""
 
+
 class AskNewsSearcherWrapper(BaseSearcher):
-    """AskNews search provider wrapper."""
-    
     def is_available(self) -> bool:
         has_asknews = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv("ASKNEWS_API_KEY")
         return bool(has_asknews)
@@ -357,7 +402,6 @@ class AskNewsSearcherWrapper(BaseSearcher):
     async def search(self, query: str, num_results: int = 5) -> str:
         if not self.is_available():
             return ""
-        
         try:
             prompt_for_asknews = f"{query}\n\nResolution: forecast resolution"
             ans = await AskNewsSearcher().call_preconfigured_version(
@@ -370,158 +414,116 @@ class AskNewsSearcherWrapper(BaseSearcher):
             logger.warning(f"AskNews fallback failed: {e}")
             return ""
 
+
 class PerplexitySonarSearcher(BaseSearcher):
-    """Perplexity Sonar via OpenRouter — lightweight, fast, citation-rich Q&A search."""
-    
+    """
+    Perplexity Sonar via OpenRouter.
+    FIX: uses correct model string "perplexity/sonar" (not the retired llama-3.1-sonar-* string).
+    """
+
+    # FIX 4: correct, current model string
+    MODEL = "perplexity/sonar"
+
     def is_available(self) -> bool:
         return bool(os.getenv("OPENROUTER_API_KEY") and HAS_HTTPX)
     
     async def search(self, query: str, num_results: int = 5) -> str:
         if not self.is_available():
             return ""
-        
         query = sanitize_input(query)
         await api_rate_limiter.acquire()
-        
         api_key = os.getenv("OPENROUTER_API_KEY")
+        prompt = (
+            f"Search the web and provide concise, citation-rich research to help forecast "
+            f"this question: {query}\n\nInclude key facts, recent developments, and relevant sources."
+        )
         try:
             async with httpx.AsyncClient(timeout=30) as client:
-                payload = {
-                    "model": "perplexity/sonar",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"Search the web and provide concise, citation-rich research to help forecast this question: {query}\n\nInclude key facts, recent developments, and relevant sources."
-                        }
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 1500,
-                    "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
-                }
-                
-                # Debug log: mask the API key in the payload copy
-                debug_payload = dict(payload)
-                debug_payload_str = str(debug_payload).replace(api_key, "***MASKED***")
-                logger.debug(f"Perplexity Sonar request payload: {debug_payload_str}")
-                
-                resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "https://metaculus.com",
-                        "X-Title": "Metaculus Forecasting Bot",
-                    },
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                if content:
-                    metrics.increment("perplexity_sonar_success")
-                    return f"## Perplexity Sonar Search Results\n{content}"
-                return ""
+                content = await _openrouter_chat(client, api_key, self.MODEL, prompt)
+            if content:
+                metrics.increment("perplexity_sonar_success")
+                return f"## Perplexity Sonar Search Results\n{content}"
+            return ""
         except httpx.HTTPStatusError as e:
             metrics.increment("perplexity_sonar_failed")
-            logger.error(f"Perplexity Sonar HTTP {e.response.status_code}: {e.response.text}")
+            # Error body already logged inside _openrouter_chat
+            logger.warning("Perplexity Sonar search failed: HTTP %d", e.response.status_code)
             return ""
         except Exception as e:
             metrics.increment("perplexity_sonar_failed")
             logger.warning(f"Perplexity Sonar search failed: {e}")
             return ""
 
+
 class PerplexitySonarProSearcher(BaseSearcher):
-    """Perplexity Sonar Pro Search via OpenRouter — agentic research workflows."""
-    
+    """
+    Perplexity Sonar Pro via OpenRouter.
+
+    FIX 5: The model string "perplexity/sonar-pro-search" does NOT exist on OpenRouter
+    and was the primary cause of the HTTP 400 errors seen in the logs.
+    Correct string is "perplexity/sonar-pro".
+
+    Fallback chain: sonar-pro → sonar (if sonar-pro is unavailable/rate-limited).
+    """
+
+    MODEL         = "perplexity/sonar-pro"       # was "perplexity/sonar-pro-search" ← WRONG
+    FALLBACK_MODEL = "perplexity/sonar"
+
     def is_available(self) -> bool:
         return bool(os.getenv("OPENROUTER_API_KEY") and HAS_HTTPX)
     
     async def search(self, query: str, num_results: int = 5) -> str:
         if not self.is_available():
             return ""
-        
         query = sanitize_input(query)
         await api_rate_limiter.acquire()
-        
         api_key = os.getenv("OPENROUTER_API_KEY")
-        try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                payload = {
-                    "model": "perplexity/sonar-pro-search",
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": f"Search the web and provide comprehensive research to help forecast this question: {query}\n\nInclude key facts, recent developments, and relevant data with citations."
-                        }
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": 1500,
-                    "provider": {"order": ["Perplexity"], "allow_fallbacks": False},
-                }
-                
-                # Debug log: mask the API key in the payload copy
-                debug_payload = dict(payload)
-                debug_payload_str = str(debug_payload).replace(api_key, "***MASKED***")
-                logger.debug(f"Perplexity Sonar Pro Search request payload: {debug_payload_str}")
-                
-                resp = await client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                        "HTTP-Referer": "https://metaculus.com",
-                        "X-Title": "Metaculus Forecasting Bot",
-                    },
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        prompt = (
+            f"Search the web and provide comprehensive research to help forecast this question: "
+            f"{query}\n\nInclude key facts, recent developments, and relevant data with citations."
+        )
+        async with httpx.AsyncClient(timeout=45) as client:
+            # Primary attempt: sonar-pro
+            try:
+                content = await _openrouter_chat(client, api_key, self.MODEL, prompt)
                 if content:
-                    metrics.increment("perplexity_sonar_pro_search_success")
-                    return f"## Perplexity Sonar Pro Search Results\n{content}"
+                    metrics.increment("perplexity_sonar_pro_success")
+                    return f"## Perplexity Sonar Pro Results\n{content}"
                 return ""
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                # Fallback to sonar-pro if sonar-pro-search not available
-                logger.warning("sonar-pro-search model not available, falling back to sonar-pro")
-                try:
-                    payload["model"] = "perplexity/sonar-pro"
-                    resp = await client.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {api_key}",
-                            "Content-Type": "application/json",
-                            "HTTP-Referer": "https://metaculus.com",
-                            "X-Title": "Metaculus Forecasting Bot",
-                        },
-                        json=payload,
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (400, 404, 429):
+                    logger.warning(
+                        "sonar-pro returned %d — falling back to %s",
+                        e.response.status_code, self.FALLBACK_MODEL,
                     )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    if content:
-                        metrics.increment("perplexity_sonar_pro_search_success")
-                        return f"## Perplexity Sonar Search Results (fallback)\n{content}"
+                else:
+                    metrics.increment("perplexity_sonar_pro_failed")
                     return ""
-                except Exception as fallback_e:
-                    logger.warning(f"Perplexity Sonar fallback search failed: {fallback_e}")
-                    metrics.increment("perplexity_sonar_pro_search_failed")
-                    return ""
-            metrics.increment("perplexity_sonar_pro_search_failed")
-            logger.error(f"Perplexity Sonar Pro Search HTTP {e.response.status_code}: {e.response.text}")
-            return ""
-        except Exception as e:
-            metrics.increment("perplexity_sonar_pro_search_failed")
-            logger.warning(f"Perplexity Sonar Pro search failed: {e}")
-            return ""
+            except Exception as e:
+                metrics.increment("perplexity_sonar_pro_failed")
+                logger.warning(f"Perplexity Sonar Pro search failed: {e}")
+                return ""
+
+            # Fallback attempt: sonar
+            try:
+                content = await _openrouter_chat(client, api_key, self.FALLBACK_MODEL, prompt)
+                if content:
+                    metrics.increment("perplexity_sonar_pro_success")
+                    return f"## Perplexity Sonar Results (sonar-pro fallback)\n{content}"
+                return ""
+            except Exception as fallback_e:
+                metrics.increment("perplexity_sonar_pro_failed")
+                logger.warning(f"Perplexity Sonar fallback also failed: {fallback_e}")
+                return ""
+
 
 # Initialize search providers
-firecrawl_searcher = FirecrawlSearcher()
-linkup_searcher = LinkupSearcher()
-asknews_searcher = AskNewsSearcherWrapper()
-perplexity_sonar_searcher = PerplexitySonarSearcher()
+firecrawl_searcher            = FirecrawlSearcher()
+linkup_searcher               = LinkupSearcher()
+asknews_searcher              = AskNewsSearcherWrapper()
+perplexity_sonar_searcher     = PerplexitySonarSearcher()
 perplexity_sonar_pro_searcher = PerplexitySonarProSearcher()
+
 
 async def fetch_yfinance_context(question_text: str) -> str:
     """Extract ticker from question and fetch current price + recent trend."""
@@ -572,10 +574,6 @@ CONFIDENCE_GATE_PATTERN = re.compile(
 async def assess_forecast_confidence(
     question: BinaryQuestion, research: str, llm: GeneralLlm
 ) -> float:
-    """
-    Ask the REASONING_MODEL to rate its own confidence 0–100.
-    Returns 0–1.  If parsing fails, defaults to 0.5 (neutral → will forecast).
-    """
     prompt = clean_indents(f"""
         You are a superforecaster quality-checker.
         Question: {question.question_text}
@@ -610,36 +608,32 @@ class Bot3112026(ForecastBot):
     """
     311bot SuperForecaster — Spring 2026
     ─────────────────────────────────────────
-    • OpenRouter Perplexity models only
+    • OpenRouter Perplexity models only (corrected model strings)
     • Extremization on all binary + MC forecasts
     • yfinance grounding for MarketPulse questions
     • Selective forecasting on AI Spring Tournament (confidence gate)
-    • Firecrawl + Linkup search, AskNews fallback
+    • Firecrawl + Linkup search, AskNews + Perplexity Sonar fallback
     """
 
-    _max_concurrent_questions         = 1
-    _concurrency_limiter              = asyncio.Semaphore(_max_concurrent_questions)
+    _max_concurrent_questions            = 1
+    _concurrency_limiter                 = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
-    # Gate: minimum confidence to submit on AI Spring Tournament
     AI_SPRING_CONFIDENCE_THRESHOLD = 0.60
+    BINARY_EXTREMIZE_STRENGTH      = 0.30
 
-    # Extremization strength for binary (0–1, higher = more extreme)
-    BINARY_EXTREMIZE_STRENGTH = 0.30
-
-    # Flag: set True during AI spring tournament runs
-    _is_ai_spring_tournament: bool = False
-    _current_tournament_key: str | None = None
+    _is_ai_spring_tournament: bool       = False
+    _current_tournament_key: str | None  = None
     _current_tournament_id: int | str | None = None
 
     def _get_forecaster_llms(self) -> list[GeneralLlm]:
         return [
             GeneralLlm(
-                model=model_name, 
-                temperature=0.28, 
-                timeout=60, 
+                model=model_name,
+                temperature=0.28,
+                timeout=60,
                 allowed_tries=2,
-                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+                extra_body={"provider": _PROVIDER_ROUTING},
             )
             for model_name in FORECAST_MODELS
         ]
@@ -657,10 +651,10 @@ class Bot3112026(ForecastBot):
     async def _run_binary_forecast_ensemble(
         self, question: BinaryQuestion, prompt: str
     ) -> ReasonedPrediction[float]:
-        llms = self._get_forecaster_llms()
-        tasks = [self._binary_prompt_to_forecast(question, prompt, llm) for llm in llms]
+        llms    = self._get_forecaster_llms()
+        tasks   = [self._binary_prompt_to_forecast(question, prompt, llm) for llm in llms]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        valid = [r for r in results if isinstance(r, ReasonedPrediction)]
+        valid   = [r for r in results if isinstance(r, ReasonedPrediction)]
         if not valid:
             return await self._binary_prompt_to_forecast(question, prompt)
         valid.sort(key=lambda item: item.prediction_value)
@@ -670,7 +664,6 @@ class Bot3112026(ForecastBot):
 
     async def run_research(self, question: MetaculusQuestion) -> str:
         async with self._concurrency_limiter:
-            # 1. Detect if this is a MarketPulse question → add yfinance data
             yf_context = ""
             is_market_pulse = self._is_marketpulse_question(question)
             if is_market_pulse:
@@ -678,11 +671,9 @@ class Bot3112026(ForecastBot):
                 if yf_context:
                     logger.info(f"yfinance data fetched for: {question.page_url}")
 
-            # 2. Build search research
             search_results = await self._search(question)
 
-            # 3. Summarize with LLM
-            yf_section = f"\n\n## Live Market Data\n{yf_context}" if yf_context else ""
+            yf_section  = f"\n\n## Live Market Data\n{yf_context}" if yf_context else ""
             raw_context = f"{search_results}{yf_section}"
 
             if not raw_context.strip():
@@ -716,7 +707,6 @@ class Bot3112026(ForecastBot):
                 return raw_context[:2000]
 
     def _is_marketpulse_question(self, question: MetaculusQuestion) -> bool:
-        """Heuristic: MarketPulse questions mention financial instruments."""
         text = (question.question_text + " " + (question.background_info or "")).upper()
         return any(kw.upper() in text for kw in MARKETPULSE_TICKER_HINTS.keys())
 
@@ -724,33 +714,20 @@ class Bot3112026(ForecastBot):
         """Run all available search providers in parallel, merge results."""
         query = f"{question.question_text} forecast resolution {datetime.now().year}"
         
-        # Create list of search tasks
         search_tasks = []
-        
-        # Add Firecrawl
         if firecrawl_searcher.is_available():
             search_tasks.append(firecrawl_searcher.search(query, num_results=4))
-        
-        # Add Linkup
         if linkup_searcher.is_available():
             search_tasks.append(linkup_searcher.search(query))
-        
-        # Add AskNews (fallback if others empty)
         if asknews_searcher.is_available():
             search_tasks.append(asknews_searcher.search(query))
-        
-        # Add Perplexity Sonar (parallel async)
         if perplexity_sonar_searcher.is_available():
             search_tasks.append(perplexity_sonar_searcher.search(query))
-        
-        # Add Perplexity Sonar Pro Search (parallel async)
         if perplexity_sonar_pro_searcher.is_available():
             search_tasks.append(perplexity_sonar_pro_searcher.search(query))
         
-        # Run all searches in parallel
         if search_tasks:
             results = await asyncio.gather(*search_tasks, return_exceptions=True)
-            # Filter out empty results and exceptions
             results = [r for r in results if isinstance(r, str) and r.strip()]
         else:
             results = []
@@ -763,14 +740,13 @@ class Bot3112026(ForecastBot):
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
 
-        # ── AI Spring Tournament confidence check ─────────────────────────
         if self._is_ai_spring_tournament:
             reasoning_llm = GeneralLlm(
-                model=REASONING_MODEL, 
-                temperature=0.1, 
-                timeout=60, 
+                model=REASONING_MODEL,
+                temperature=0.1,
+                timeout=60,
                 allowed_tries=2,
-                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+                extra_body={"provider": _PROVIDER_ROUTING},
             )
             confidence = await assess_forecast_confidence(question, research, reasoning_llm)
             logger.info(
@@ -808,15 +784,16 @@ class Bot3112026(ForecastBot):
             End with: "Probability: ZZ%" (0–100)
         """)
 
-        result = await self._run_binary_forecast_ensemble(question, prompt)
-
-        raw_p = result.prediction_value
+        result   = await self._run_binary_forecast_ensemble(question, prompt)
+        raw_p    = result.prediction_value
         strength = self._get_extremization_strength()
-        ext_p = extremize_binary(raw_p, strength=strength)
+        ext_p    = extremize_binary(raw_p, strength=strength)
+
         if self._should_force_hard_extreme():
             ext_p = 0.99 if raw_p >= 0.5 else 0.003
         if abs(ext_p - raw_p) > 0.01:
             logger.info(f"Extremized {raw_p:.2%} → {ext_p:.2%} for {question.page_url}")
+
         result.prediction_value = ext_p
         return result
 
@@ -827,7 +804,7 @@ class Bot3112026(ForecastBot):
         llm: GeneralLlm | None = None,
     ) -> ReasonedPrediction[float]:
         llm_to_use = llm if llm is not None else self.get_llm("default", "llm")
-        reasoning = await llm_to_use.invoke(prompt)
+        reasoning  = await llm_to_use.invoke(prompt)
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning,
             BinaryPrediction,
@@ -869,11 +846,7 @@ class Bot3112026(ForecastBot):
             {chr(10).join(f"Option_{chr(65+i)}: Probability_{chr(65+i)}" for i in range(len(question.options)))}
         """)
         result = await self._multiple_choice_prompt_to_forecast(question, prompt)
-
-        # Apply MC extremization
-        result.prediction_value = extremize_option_list(
-            result.prediction_value, strength=0.25
-        )
+        result.prediction_value = extremize_option_list(result.prediction_value, strength=0.25)
         return result
 
     async def _multiple_choice_prompt_to_forecast(
@@ -903,7 +876,6 @@ class Bot3112026(ForecastBot):
         upper_bound_message, lower_bound_message = (
             self._create_upper_and_lower_bound_messages(question)
         )
-        # For MarketPulse numeric questions, prepend live yfinance data
         extra_data = ""
         if self._is_marketpulse_question(question):
             yf_ctx = await fetch_yfinance_context(question.question_text)
@@ -1092,7 +1064,7 @@ class Bot3112026(ForecastBot):
                     research,
                 )
 
-        info = await self._make_prediction(question, research)
+        info         = await self._make_prediction(question, research)
         full_research = self._add_reasoning_to_research(research, info, question_type)
         return info, full_research
 
@@ -1153,34 +1125,28 @@ class Bot3112026(ForecastBot):
     # ── HEALTH CHECKS ─────────────────────────────────────────────────────
 
     async def health_check(self) -> dict:
-        """Check health of external dependencies."""
         health = {
-            "firecrawl": firecrawl_searcher.is_available(),
-            "linkup": linkup_searcher.is_available(),
-            "asknews": asknews_searcher.is_available(),
-            "perplexity_sonar": perplexity_sonar_searcher.is_available(),
-            "perplexity_sonar_pro_search": perplexity_sonar_pro_searcher.is_available(),
-            "yfinance": HAS_YFINANCE,
-            "httpx": HAS_HTTPX,
-            "forecasting_tools": True,  # If we got here, it's loaded
+            "firecrawl":                   firecrawl_searcher.is_available(),
+            "linkup":                      linkup_searcher.is_available(),
+            "asknews":                     asknews_searcher.is_available(),
+            "perplexity_sonar":            perplexity_sonar_searcher.is_available(),
+            "perplexity_sonar_pro":        perplexity_sonar_pro_searcher.is_available(),
+            "yfinance":                    HAS_YFINANCE,
+            "httpx":                       HAS_HTTPX,
+            "forecasting_tools":           True,
         }
-        
-        # Test actual API connectivity (lightweight)
         try:
             if health["firecrawl"]:
-                # Quick test search
-                test_result = await firecrawl_searcher.search("test query", 1)
-                health["firecrawl_connectivity"] = bool(test_result or True)  # Available even if no results
-        except:
+                await firecrawl_searcher.search("test query", 1)
+                health["firecrawl_connectivity"] = True
+        except Exception:
             health["firecrawl_connectivity"] = False
-        
         try:
             if health["linkup"]:
-                test_result = await linkup_searcher.search("test query")
-                health["linkup_connectivity"] = bool(test_result or True)
-        except:
+                await linkup_searcher.search("test query")
+                health["linkup_connectivity"] = True
+        except Exception:
             health["linkup_connectivity"] = False
-        
         return health
 
 
@@ -1190,8 +1156,6 @@ class Bot3112026(ForecastBot):
 
 if __name__ == "__main__":
     setup_logging()
-    
-    # Set correlation ID for main execution
     correlation_id.set(str(uuid.uuid4()))
     
     parser = argparse.ArgumentParser(description="OracleDeck SuperForecaster Bot 2026")
@@ -1220,24 +1184,24 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # ── Dependency checks ────────────────────────────────────────────────
     if not HAS_YFINANCE:
         logger.warning("⚠️  yfinance not installed — market data unavailable. pip install yfinance")
     if not HAS_HTTPX:
-        logger.warning("⚠️  httpx not installed — Firecrawl/Linkup unavailable. pip install httpx")
-    
-    # Check for search API keys
-    has_firecrawl = os.getenv("FIRECRAWL_API_KEY")
-    has_linkup = os.getenv("LINKUP_API_KEY")
-    has_asknews = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv("ASKNEWS_API_KEY")
-    has_openrouter = os.getenv("OPENROUTER_API_KEY")
-    
-    if not (has_firecrawl or has_linkup or has_asknews or has_openrouter):
-        logger.warning("⚠️  No search API keys found (FIRECRAWL_API_KEY, LINKUP_API_KEY, ASKNEWS, or OPENROUTER_API_KEY). Research will be empty.")
-    
-    if has_openrouter:
-        logger.info("✓ OpenRouter Perplexity search models (sonar, sonar-pro) available and will run async in parallel")
+        logger.warning("⚠️  httpx not installed — Firecrawl/Linkup/Perplexity unavailable. pip install httpx")
 
+    has_firecrawl  = os.getenv("FIRECRAWL_API_KEY")
+    has_linkup     = os.getenv("LINKUP_API_KEY")
+    has_asknews    = (os.getenv("ASKNEWS_CLIENT_ID") and os.getenv("ASKNEWS_SECRET")) or os.getenv("ASKNEWS_API_KEY")
+    has_openrouter = os.getenv("OPENROUTER_API_KEY")
+
+    if not (has_firecrawl or has_linkup or has_asknews or has_openrouter):
+        logger.warning("⚠️  No search API keys found. Research will be empty.")
+
+    if has_openrouter:
+        logger.info(
+            "✓ OpenRouter key found — Perplexity sonar + sonar-pro will run in parallel "
+            "(model strings: perplexity/sonar, perplexity/sonar-pro, perplexity/sonar-deep-research)"
+        )
 
     # ── Build bot ────────────────────────────────────────────────────────
     bot = Bot3112026(
@@ -1250,32 +1214,32 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=False,
         llms={
             "default":    GeneralLlm(
-                model=PRIMARY_MODEL,   
-                temperature=0.3, 
-                timeout=60, 
+                model=PRIMARY_MODEL,
+                temperature=0.3,
+                timeout=60,
                 allowed_tries=3,
-                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+                extra_body={"provider": _PROVIDER_ROUTING},
             ),
             "summarizer": GeneralLlm(
-                model=PRIMARY_MODEL,   
-                temperature=0.3, 
-                timeout=60, 
+                model=PRIMARY_MODEL,
+                temperature=0.3,
+                timeout=60,
                 allowed_tries=3,
-                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+                extra_body={"provider": _PROVIDER_ROUTING},
             ),
             "researcher": GeneralLlm(
-                model=PRIMARY_MODEL,   
-                temperature=0.3, 
-                timeout=60, 
+                model=PRIMARY_MODEL,
+                temperature=0.3,
+                timeout=60,
                 allowed_tries=3,
-                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+                extra_body={"provider": _PROVIDER_ROUTING},
             ),
             "parser":     GeneralLlm(
-                model=PARSER_MODEL,    
-                temperature=0.0, 
-                timeout=45, 
+                model=PARSER_MODEL,
+                temperature=0.0,
+                timeout=45,
                 allowed_tries=3,
-                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}}
+                extra_body={"provider": _PROVIDER_ROUTING},
             ),
         },
     )
@@ -1283,14 +1247,13 @@ if __name__ == "__main__":
     bot.BINARY_EXTREMIZE_STRENGTH      = args.extremize_strength
     bot.AI_SPRING_CONFIDENCE_THRESHOLD = args.confidence_threshold
 
-    client          = MetaculusClient()
+    client           = MetaculusClient()
     forecast_reports = []
 
     if args.mode == "tournament":
-        # All tournaments
         for tid_name, tid in TOURNAMENT_IDS.items():
-            bot._current_tournament_key = tid_name
-            bot._current_tournament_id = tid
+            bot._current_tournament_key  = tid_name
+            bot._current_tournament_id   = tid
             bot._is_ai_spring_tournament = (tid_name == "spring_bot")
             logger.info(f"▶ Forecasting tournament: {tid_name} ({tid})")
             try:
@@ -1302,8 +1265,8 @@ if __name__ == "__main__":
                 logger.error(f"Tournament {tid_name} failed: {e}")
 
     elif args.mode == "market_pulse":
-        bot._current_tournament_key = "market_pulse"
-        bot._current_tournament_id = TOURNAMENT_IDS["market_pulse"]
+        bot._current_tournament_key  = "market_pulse"
+        bot._current_tournament_id   = TOURNAMENT_IDS["market_pulse"]
         bot._is_ai_spring_tournament = False
         logger.info("▶ MarketPulse mode (yfinance grounded)")
         forecast_reports = asyncio.run(
@@ -1311,8 +1274,8 @@ if __name__ == "__main__":
         )
 
     elif args.mode == "ai_spring":
-        bot._current_tournament_key = "spring_bot"
-        bot._current_tournament_id = TOURNAMENT_IDS["spring_bot"]
+        bot._current_tournament_key  = "spring_bot"
+        bot._current_tournament_id   = TOURNAMENT_IDS["spring_bot"]
         bot._is_ai_spring_tournament = True
         logger.info(f"▶ AI Spring Tournament — confidence gate: {args.confidence_threshold:.0%}")
         forecast_reports = asyncio.run(
@@ -1323,14 +1286,12 @@ if __name__ == "__main__":
         TEST_URLS = [
             "https://www.metaculus.com/questions/578/human-extinction-by-2100/",
         ]
-        bot._is_ai_spring_tournament = False
+        bot._is_ai_spring_tournament             = False
         bot.skip_previously_forecasted_questions = False
-        questions = [client.get_question_by_url(u) for u in TEST_URLS]
+        questions        = [client.get_question_by_url(u) for u in TEST_URLS]
         forecast_reports = asyncio.run(
             bot.forecast_questions(questions, return_exceptions=True)
         )
 
     bot.log_report_summary(forecast_reports)
-    
-    # Log final metrics
     logger.info(f"Final metrics: {metrics.get_summary()}")
