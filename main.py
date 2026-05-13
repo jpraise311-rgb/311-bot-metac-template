@@ -128,22 +128,18 @@ def setup_logging():
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MODEL CONFIGURATION — Free OpenRouter models
+#  MODEL CONFIGURATION — OpenRouter Perplexity models
 # ═══════════════════════════════════════════════════════════════════════════
 
-# Using OpenRouter's current available free tier models
-# Format for LiteLLM: "openrouter/free" for the generic free model,
-# or "{provider}/{model}:free" for a provider-specific free model.
-PRIMARY_MODEL   = "openrouter/free"                                       # Primary — generic free model
-REASONING_MODEL = "openrouter/nvidia/nemotron-3-super-120b-a12b:free"      # Best for analysis
-PARSER_MODEL    = "openrouter/free"                                       # Structured output parsing (generic free model)
+# Using OpenRouter Perplexity models for all forecasting, reasoning, and parsing.
+PRIMARY_MODEL   = "openrouter/perplexity/sonar-pro-chat"                 # Primary forecasting model
+REASONING_MODEL = "openrouter/perplexity/sonar-pro"                      # Confidence & reasoning model
+PARSER_MODEL    = "openrouter/perplexity/sonar-mini"                     # Structured output parser
 
 FORECAST_MODELS = [
-    "openrouter/elephant-alpha",
-    "openrouter/owl-alpha",
-    "openrouter/nvidia/nemotron-3-super-120b-a12b:free",
-    "openrouter/poolside/laguna-m.1:free",
-    "openrouter/z-ai/glm-4.5-air:free",
+    "openrouter/perplexity/sonar-pro",
+    "openrouter/perplexity/sonar-pro-chat",
+    "openrouter/perplexity/sonar-mini",
 ]
 
 FORECAST_33022_ID = 33022
@@ -568,7 +564,7 @@ class Bot3112026(ForecastBot):
     """
     311bot SuperForecaster — Spring 2026
     ─────────────────────────────────────────
-    • Free OpenRouter models with fallback rotation
+    • OpenRouter Perplexity models only
     • Extremization on all binary + MC forecasts
     • yfinance grounding for MarketPulse questions
     • Selective forecasting on AI Spring Tournament (confidence gate)
