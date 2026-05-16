@@ -45,6 +45,27 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+def extremize_binary(p: float, strength: float = 0.3) -> float:
+    """
+    Power extremization: push probabilities away from 0.5.
+    """
+    p = max(0.02, min(0.98, p))
+    denom = p ** (1 - strength) + (1 - p) ** (1 - strength)
+    p_ext = p ** (1 - strength) / denom
+    p_ext = max(0.02, min(0.98, p_ext))
+    if 0.43 <= p_ext <= 0.57:
+        p_ext = 0.40 if p_ext < 0.50 else 0.60
+    return round(p_ext, 4)
+
+
+def extremize_option_list(options: PredictedOptionList, strength: float = 0.25) -> PredictedOptionList:
+    raw = [(opt, max(1e-6, opt.probability) ** (1 + strength)) for opt in options.predicted_options]
+    total = sum(v for _, v in raw)
+    for opt, v in raw:
+        opt.probability = round(v / total, 4)
+    return options
+
+
 class SummerTemplateBot2026(ForecastBot):
     """
     This is the template bot for Summer 2026 Metaculus AI Tournament.
@@ -128,12 +149,14 @@ class SummerTemplateBot2026(ForecastBot):
                 extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
             ),
         },
+        """
 
     _max_concurrent_questions = (
         1  # Set this to whatever works for your search-provider/ai-model rate limits
     )
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
+    _current_tournament_key: str | None = None
 
     ##################################### RESEARCH #####################################
 
@@ -189,7 +212,7 @@ class SummerTemplateBot2026(ForecastBot):
             search_results = await self._search(question)
 
             # 3. Summarize with a single Perplexity model (via OpenRouter) using the dedicated `researcher` LLM.
-            yf_section = f"\n\n## Live Market Data\n{yf_context}" if yf_context else ""
+            yf_section = ""
             raw_context = f"{search_results}{yf_section}"
 
             if not raw_context.strip():
@@ -223,8 +246,6 @@ class SummerTemplateBot2026(ForecastBot):
             except Exception as e:
                 logger.error(f"Research summarization failed with researcher LLM: {e}")
                 return raw_context[:2000]
-            logger.info(f"Found Research for URL {question.page_url}:\n{research}")
-            return research
 
     ##################################### BINARY QUESTIONS #####################################
 
@@ -266,7 +287,16 @@ class SummerTemplateBot2026(ForecastBot):
             """
         )
 
-        return await self._binary_prompt_to_forecast(question, prompt)
+        result = await self._binary_prompt_to_forecast(question, prompt)
+        if self._current_tournament_key == "minibench":
+            original_value = result.prediction_value
+            extremized_value = extremize_binary(original_value, strength=4.0)
+            if extremized_value != original_value:
+                logger.info(
+                    f"Minibench extremized {original_value:.2%} -> {extremized_value:.2%} for {question.page_url}"
+                )
+            result.prediction_value = extremized_value
+        return result
 
     async def _binary_prompt_to_forecast(
         self,
@@ -750,11 +780,13 @@ if __name__ == "__main__":
     # summary printers below.
     client = MetaculusClient()
     if run_mode == "tournament":
+        template_bot._current_tournament_key = "tournament"
         seasonal_tournament_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_AI_COMPETITION_ID, return_exceptions=True
             )
         )
+        template_bot._current_tournament_key = "minibench"
         minibench_reports = asyncio.run(
             template_bot.forecast_on_tournament(
                 client.CURRENT_MINIBENCH_ID, return_exceptions=True
