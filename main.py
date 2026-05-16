@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL   = "openrouter/perplexity/llama-3.1-sonar-large-128k-online"
+_CLAUDE_OPUS_MODEL   = "openrouter/perplexity/sonar-pro-search"
 _CLAUDE_SONNET_MODEL = "openrouter/perplexity/sonar-pro"
 _GPT_MODEL           = "openrouter/perplexity/sonar"
 
