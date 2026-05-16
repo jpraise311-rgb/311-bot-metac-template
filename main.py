@@ -755,14 +755,14 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         # llms={
         #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
+        #         model="openrouter/perplexity/sonar-reasoning",
         #         temperature=0.3,
         #         timeout=40,
         #         allowed_tries=2,
         #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
+        #     "summarizer": "openrouter/perplexity/sonar",
+        #     "researcher": "openrouter/perplexity/sonar-reasoning",
+        #     "parser": "openrouter/perplexity/sonar",
         # },
     )
 
