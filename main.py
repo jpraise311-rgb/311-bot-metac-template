@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL   = "openrouter/qwen/qwen3-next-80b-a3b-instruct"
-_CLAUDE_SONNET_MODEL = "openrouter/z-ai/glm-4.5-air:free"
+_CLAUDE_OPUS_MODEL   = "openrouter/perplexity/llama-3.1-sonar-large-128k-online"
+_CLAUDE_SONNET_MODEL = "openrouter/perplexity/sonar-pro"
 _GPT_MODEL           = "openrouter/perplexity/sonar"
 
 
