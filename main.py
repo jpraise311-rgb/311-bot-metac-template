@@ -92,36 +92,36 @@ class SummerTemplateBot2026(ForecastBot):
                 temperature=0.3,
                 timeout=40,
                 allowed_tries=2,
+        llms={
+            # Use the full Perplexity/OpenRouter ensemble for forecasting
+            # `default` provides an ensemble of GeneralLlm instances using each FORECAST_MODEL.
+            "default": [
+                GeneralLlm(
+                    model=m,
+                    temperature=0.28,
+                    timeout=60,
+                    allowed_tries=3,
+                    extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
+                )
+                for m in FORECAST_MODELS
+            ],
+            "summarizer": GeneralLlm(
+                model=FORECAST_MODELS[0],
+                temperature=0.3,
+                timeout=60,
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
             ),
-            "summarizer": "openai/gpt-4o-mini",
+            # Prefer AskNews for deep research; forecasting_tools knows how to handle the preconfigured AskNews string
             "researcher": "asknews/news-summaries",
-            "parser": "openai/gpt-4o-mini",
+            "parser": GeneralLlm(
+                model=PARSER_MODEL,
+                temperature=0.0,
+                timeout=45,
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
+            ),
         },
-    )
-    ```
-
-    Then you can access the model in custom functions like this:
-    ```python
-    research_strategy = self.get_llm("researcher", "model_name"
-    if research_strategy == "asknews/news-summaries":
-        ...
-    # OR
-    summarizer = await self.get_llm("summarizer", "llm").invoke(prompt)
-    # OR
-    reasoning = await self.get_llm("default", "llm").invoke(prompt)
-    ```
-
-    If you end up having trouble with rate limits and want to try a more sophisticated rate limiter try:
-    ```python
-    from forecasting_tools import RefreshingBucketRateLimiter
-    rate_limiter = RefreshingBucketRateLimiter(
-        capacity=2,
-        refresh_rate=1,
-    ) # Allows 1 request per second on average with a burst of 2 requests initially. Set this as a class variable
-    await self.rate_limiter.wait_till_able_to_acquire_resources(1) # 1 because it's consuming 1 request (use more if you are adding a token limit)
-    ```
-    Additionally OpenRouter has large rate limits immediately on account creation
-    """
 
     _max_concurrent_questions = (
         1  # Set this to whatever works for your search-provider/ai-model rate limits
