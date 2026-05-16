@@ -109,7 +109,7 @@ class SummerTemplateBot2026(ForecastBot):
         ...
         llms={  # choose your model names or GeneralLlm llms here, otherwise defaults will be chosen for you
             "default": GeneralLlm(
-                model="openrouter/openai/gpt-4o", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
+                model="openrouter/perplexity/sonar", # "anthropic/claude-sonnet-4-20250514", etc (see docs for litellm)
                 temperature=0.3,
                 timeout=40,
                 allowed_tries=2,
@@ -185,10 +185,10 @@ class SummerTemplateBot2026(ForecastBot):
             if isinstance(researcher, GeneralLlm):
                 research = await researcher.invoke(prompt)
             elif (
-                researcher == "asknews/news-summaries"
-                or researcher == "asknews/deep-research/low-depth"
-                or researcher == "asknews/deep-research/medium-depth"
-                or researcher == "asknews/deep-research/high-depth"
+                researcher == "openrouter/perplexity/sonar-pro-search"
+                or researcher == "openrouter/perplexity/sonar-reasoning-pro"
+                or researcher == "openrouter/perplexity/sonar-deep-research"
+                or researcher == "openrouter/perplexity/sonar-reasoning"
             ):
                 research = await AskNewsSearcher().call_preconfigured_version(
                     researcher, prompt
