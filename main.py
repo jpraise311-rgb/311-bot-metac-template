@@ -1403,7 +1403,7 @@ if __name__ == "__main__":
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
+        skip_previously_forecasted_questions=False,
         extra_metadata_in_explanation=True,
     )
 
