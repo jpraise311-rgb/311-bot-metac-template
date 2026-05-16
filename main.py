@@ -112,8 +112,14 @@ class SummerTemplateBot2026(ForecastBot):
                 allowed_tries=3,
                 extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": False}},
             ),
-            # Prefer AskNews for deep research; forecasting_tools knows how to handle the preconfigured AskNews string
-            "researcher": "asknews/news-summaries",
+            # Researcher: use a single Perplexity/OpenRouter reasoning model to summarize parallel search results
+            "researcher": GeneralLlm(
+                model=REASONING_MODEL,
+                temperature=0.15,
+                timeout=90,
+                allowed_tries=3,
+                extra_body={"provider": {"order": ["Perplexity"], "allow_fallbacks": True}},
+            ),
             "parser": GeneralLlm(
                 model=PARSER_MODEL,
                 temperature=0.0,
@@ -177,7 +183,46 @@ class SummerTemplateBot2026(ForecastBot):
             elif not researcher or researcher == "None" or researcher == "no_research":
                 research = ""
             else:
-                research = await self.get_llm("researcher", "llm").invoke(prompt)
+                research = await self._search(question)
+
+            # Run available search providers in parallel (Firecrawl, Linkup, AskNews, Perplexity Sonar)
+            search_results = await self._search(question)
+
+            # 3. Summarize with a single Perplexity model (via OpenRouter) using the dedicated `researcher` LLM.
+            yf_section = f"\n\n## Live Market Data\n{yf_context}" if yf_context else ""
+            raw_context = f"{search_results}{yf_section}"
+
+            if not raw_context.strip():
+                logger.warning(f"No research gathered for {question.page_url}")
+                return "No research available."
+
+            prompt = clean_indents(f"""
+                You are an assistant to a superforecaster.
+                Produce a concise, dense research brief (max 600 words) covering:
+                - Key facts relevant to this question
+                - Current status / recent developments
+                - Whether the question would currently resolve Yes or No (if applicable)
+                - Any relevant base rates or market signals
+
+                Do NOT produce a forecast yourself.
+
+                Question: {question.question_text}
+                Resolution criteria: {question.resolution_criteria}
+                {question.fine_print}
+
+                Raw research gathered:
+                {raw_context[:4000]}
+            """)
+
+            # Use the configured 'researcher' LLM (a single Perplexity/OpenRouter model) to summarize.
+            try:
+                research_llm = self.get_llm("researcher", "llm")
+                research = await research_llm.invoke(prompt)
+                logger.info(f"Research ready for {question.page_url} ({len(research)} chars)")
+                return research
+            except Exception as e:
+                logger.error(f"Research summarization failed with researcher LLM: {e}")
+                return raw_context[:2000]
             logger.info(f"Found Research for URL {question.page_url}:\n{research}")
             return research
 
