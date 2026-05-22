@@ -1,4 +1,3 @@
-
 import argparse
 import asyncio
 import json
@@ -42,18 +41,58 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
+BOT_NAME = "311bot"
+
 # ---------------------------------------------------------------------------
 # Model identifiers
 # ---------------------------------------------------------------------------
-_CLAUDE_OPUS_MODEL   = "openrouter/perplexity/sonar-pro-search"
-_CLAUDE_SONNET_MODEL = "openrouter/perplexity/sonar-pro"
-_GPT_MODEL           = "openrouter/perplexity/sonar"
+# Perplexity models via OpenRouter — correct prefix is "openrouter/perplexity/"
+# sonar-pro         : best general-purpose online model (research + reasoning)
+# sonar-reasoning   : chain-of-thought online model (deep analysis)
+# sonar             : fast, lightweight online model (classification, parsing)
+# sonar-pro-search  : NOT a valid model string — removed
+
+_MODEL_DEFAULT    = "openrouter/perplexity/sonar-pro"          # primary forecaster
+_MODEL_SUMMARIZER = "openrouter/perplexity/sonar-pro"          # research summariser
+_MODEL_RESEARCHER = "openrouter/perplexity/sonar-reasoning"    # deep research / decomposition
+_MODEL_PARSER     = "openrouter/perplexity/sonar"              # fast structured extraction
+_MODEL_CLASSIFIER = "openrouter/perplexity/sonar"              # fast domain classification
+
+# Free-tier fallbacks (tried in order if primary fails)
+_FREE_FALLBACKS = [
+    "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+    "openrouter/nousresearch/hermes-3-llama-3.1-405b:free",
+    "openrouter/mistralai/mistral-7b-instruct:free",
+]
+
+
+# ===========================================================================
+# Fallback-aware LLM invoke helper
+# ===========================================================================
+
+async def _invoke_with_fallback(primary_llm: GeneralLlm, prompt: str, fallback_models: list[str] | None = None) -> str:
+    """
+    Attempt primary_llm.invoke(prompt). On NotFoundError / provider error,
+    try each free-tier fallback in sequence before giving up.
+    """
+    try:
+        return await primary_llm.invoke(prompt)
+    except Exception as primary_exc:
+        err_str = str(primary_exc)
+        if fallback_models and ("NotFoundError" in err_str or "404" in err_str or "No allowed providers" in err_str):
+            for model in fallback_models:
+                try:
+                    logger.warning(f"[{BOT_NAME}] Primary model failed ({primary_exc}), trying fallback: {model}")
+                    fallback_llm = GeneralLlm(model=model, temperature=0.15, timeout=60, allowed_tries=2)
+                    return await fallback_llm.invoke(prompt)
+                except Exception as fb_exc:
+                    logger.warning(f"[{BOT_NAME}] Fallback {model} also failed: {fb_exc}")
+                    continue
+        raise primary_exc
 
 
 # ===========================================================================
 # 1. QUESTION CLASSIFIER
-#    Detects domain and geography from question text so downstream components
-#    can adapt their strategy without hard-coded rules.
 # ===========================================================================
 
 DOMAINS = [
@@ -68,16 +107,16 @@ class QuestionProfile:
     """Metadata inferred about a question before forecasting begins."""
     domain: str                    = "other"
     geo_scope: str                 = "global"
-    geography: str                 = ""       # e.g. "United States", "Europe"
+    geography: str                 = ""
     time_horizon_days: int         = 365
     is_quantitative: bool          = False
-    confidence_in_profile: float   = 0.0     # 0-1; low = classifier was uncertain
+    confidence_in_profile: float   = 0.0
 
 
 class QuestionClassifier:
     """
     Uses an LLM to classify a question's domain, geography, and time horizon.
-    Results inform ModellingStrategy and source selection.
+    Falls back to free-tier models if the primary classifier is unavailable.
     """
 
     def __init__(self, llm: GeneralLlm):
@@ -104,7 +143,7 @@ class QuestionClassifier:
             """
         )
         try:
-            raw = await self._llm.invoke(prompt)
+            raw = await _invoke_with_fallback(self._llm, prompt, _FREE_FALLBACKS)
             raw = raw.strip()
             start, end = raw.find("{"), raw.rfind("}")
             if start != -1 and end != -1:
@@ -125,7 +164,6 @@ class QuestionClassifier:
 
 # ===========================================================================
 # 2. MODELLING STRATEGY
-#    Selects the right forecasting frame per question type / domain.
 # ===========================================================================
 
 class ModellingStrategy:
@@ -205,7 +243,6 @@ class ModellingStrategy:
 
 # ===========================================================================
 # 3. PLUGGABLE SOURCE REGISTRY
-#    Any data source implements BaseSource and registers itself.
 # ===========================================================================
 
 class BaseSource(ABC):
@@ -238,21 +275,23 @@ class SourceRegistry:
         return [s for s in self._sources if s.is_available()]
 
     async def fetch_all(self, query: str) -> list[str]:
-        """Query all available sources in parallel."""
+        """Query all available sources in PARALLEL."""
         sources = self.available_sources()
+        if not sources:
+            return []
         tasks   = [s.fetch(query) for s in sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         blocks: list[str] = []
         for src, res in zip(sources, results):
             if isinstance(res, Exception):
-                blocks.append(f"[{src.name}] Query failed: {res}")
+                logger.debug(f"[SourceRegistry] {src.name} failed: {res}")
             elif isinstance(res, str) and res.strip():
                 blocks.append(f"[{src.name}]\n{res}")
         return blocks
 
 
 # ---------------------------------------------------------------------------
-# TavilySearcher (standalone; also wrapped by TavilySource)
+# TavilySearcher
 # ---------------------------------------------------------------------------
 
 def _format_tavily_results(query: str, results: dict[str, Any], max_results: int = 6) -> str:
@@ -287,15 +326,15 @@ class TavilySearcher:
         exclude_domains: list[str] | None = None,
         timeout_s: int = 30,
     ):
-        self.api_key          = api_key
-        self.max_results      = max_results
-        self.search_depth     = search_depth
-        self.include_answer   = include_answer
+        self.api_key             = api_key
+        self.max_results         = max_results
+        self.search_depth        = search_depth
+        self.include_answer      = include_answer
         self.include_raw_content = include_raw_content
-        self.include_images   = include_images
-        self.include_domains  = include_domains
-        self.exclude_domains  = exclude_domains
-        self.timeout_s        = timeout_s
+        self.include_images      = include_images
+        self.include_domains     = include_domains
+        self.exclude_domains     = exclude_domains
+        self.timeout_s           = timeout_s
 
     def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
@@ -326,7 +365,7 @@ class TavilySource(BaseSource):
 
     def __init__(self, api_key: str, include_domains: list[str] | None = None,
                  exclude_domains: list[str] | None = None):
-        self._api_key = api_key
+        self._api_key  = api_key
         self._searcher = TavilySearcher(
             api_key=api_key,
             include_domains=include_domains,
@@ -348,39 +387,41 @@ class TavilySource(BaseSource):
 
 class PerplexitySource(BaseSource):
     """
-    Research source using Perplexity models via OpenRouter.
-    Performs web search and synthesis using online-capable models.
+    Research source using Perplexity online models via OpenRouter.
+    Each instance uses a different model for diversity of perspective.
+    Falls back to free-tier if the assigned model is unavailable.
     """
-    
+
     def __init__(self, model: str, llm: GeneralLlm):
-        self.name = f"perplexity_{model.split('/')[-1]}"
+        self.name  = f"perplexity_{model.split('/')[-1]}"
         self._model = model
-        self._llm = llm
-    
+        self._llm   = llm
+
     def is_available(self) -> bool:
         return self._llm is not None
-    
+
     async def fetch(self, query: str) -> str:
         try:
             prompt = clean_indents(
                 f"""
                 Search the web and provide research findings for this forecasting query:
-                
+
                 {query}
-                
+
                 Return a concise summary of:
                 - Recent developments and trends
                 - Key statistics or data points
                 - Expert opinions or forecasts
                 - Market signals if applicable
-                
-                Be information-dense and cite sources.
+
+                Be information-dense and cite sources where possible.
                 """
             )
-            result = await self._llm.invoke(prompt)
+            result = await _invoke_with_fallback(self._llm, prompt, _FREE_FALLBACKS)
             return f"Query: {query}\n\n{result}"
         except Exception as exc:
-            return f"Query: {query}\n- Research failed: {type(exc).__name__}: {exc}"
+            logger.debug(f"[{self.name}] fetch failed: {type(exc).__name__}: {exc}")
+            return ""
 
 
 # ===========================================================================
@@ -389,13 +430,13 @@ class PerplexitySource(BaseSource):
 
 @dataclass
 class ValidationRecord:
-    question_url:          str
-    question_text:         str
-    domain:                str
-    geo_scope:             str
-    strategy:              str
-    prediction_value:      str
-    confidence_score:      float
+    question_url:           str
+    question_text:          str
+    domain:                 str
+    geo_scope:              str
+    strategy:               str
+    prediction_value:       str
+    confidence_score:       float
     flagged_low_confidence: bool
     ts: float = field(default_factory=time.time)
 
@@ -404,16 +445,11 @@ class ForecastValidator:
     """
     Tracks every forecast, computes a heuristic confidence score, and persists
     a ledger to SQLite for post-hoc calibration analysis.
-
-    Confidence score components (0-1):
-      - classifier_confidence : how sure the domain classifier was
-      - evidence_richness     : more research text → higher score (saturates at ~3000 chars)
-      - signal_strength       : for binary, distance from 0.5 rewards conviction
     """
 
     LOW_CONFIDENCE_THRESHOLD = 0.35
 
-    def __init__(self, db_path: str = "geobot_validation.db"):
+    def __init__(self, db_path: str = "311bot_validation.db"):
         self._db_path = db_path
         self._init_db()
 
@@ -528,7 +564,6 @@ class ForecastValidator:
 class ClientSpecialisation:
     """
     Optional configuration block for client-specific tuning.
-    Inject at Geobot construction time.
 
     Parameters
     ----------
@@ -550,7 +585,7 @@ class ClientSpecialisation:
 # ===========================================================================
 
 class ResearchCache:
-    def __init__(self, db_path: str = "geobot_cache.db"):
+    def __init__(self, db_path: str = "311bot_cache.db"):
         self._db_path = db_path
         self._init_db()
 
@@ -620,47 +655,50 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 # MAIN BOT CLASS
 # ===========================================================================
 
-class Geobot(ForecastBot):
+class Bot311(ForecastBot):
     """
-    Geobot superforecaster bot.
+    311bot superforecaster bot.
 
     Inspired by the research finding that structured forecasters using open-source
     information outperform trained domain experts. This engine:
       • Dynamically classifies each question (domain + geography)
       • Selects the most appropriate modelling strategy per question
-      • Queries all registered information sources in parallel
+      • Queries all registered information sources in PARALLEL
       • Validates every forecast and persists a calibration ledger
       • Accepts client-specific specialisation at construction time
+      • Falls back to free-tier OpenRouter models on provider errors
     """
 
     _max_concurrent_questions = 3
     _concurrency_limiter      = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    # Search throttle only — LLM calls are non-blocking and run in parallel
     _min_seconds_between_search_calls = 1.2
-    _min_seconds_between_llm_calls    = 0.35
     _last_search_call_ts = 0.0
-    _last_llm_call_ts    = 0.0
 
     def __init__(self, *args, client_spec: ClientSpecialisation | None = None, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            opus_llm      = GeneralLlm(model=_CLAUDE_OPUS_MODEL,   temperature=0.15, timeout=90, allowed_tries=3)
-            sonnet_llm    = GeneralLlm(model=_CLAUDE_SONNET_MODEL, temperature=0.15, timeout=60, allowed_tries=3)
-            gpt_llm       = GeneralLlm(model=_GPT_MODEL,           temperature=0.15, timeout=60, allowed_tries=3)
-            perplexity_llm = GeneralLlm(model="openrouter/perplexity/sonar-pro", temperature=0.3, timeout=45, allowed_tries=2)
+            # Each role uses the best-fit Perplexity model for that task
+            default_llm    = GeneralLlm(model=_MODEL_DEFAULT,    temperature=0.15, timeout=90,  allowed_tries=3)
+            summarizer_llm = GeneralLlm(model=_MODEL_SUMMARIZER, temperature=0.15, timeout=60,  allowed_tries=3)
+            researcher_llm = GeneralLlm(model=_MODEL_RESEARCHER, temperature=0.25, timeout=120, allowed_tries=3)
+            parser_llm     = GeneralLlm(model=_MODEL_PARSER,     temperature=0.10, timeout=45,  allowed_tries=3)
+            classifier_llm = GeneralLlm(model=_MODEL_CLASSIFIER, temperature=0.10, timeout=30,  allowed_tries=2)
             llms = {
-                "default":    opus_llm,
-                "summarizer": sonnet_llm,
-                "researcher": perplexity_llm,
-                "parser":     gpt_llm,
+                "default":    default_llm,
+                "summarizer": summarizer_llm,
+                "researcher": researcher_llm,
+                "parser":     parser_llm,
+                "classifier": classifier_llm,
             }
         super().__init__(*args, llms=llms, **kwargs)
 
         self._client_spec    = client_spec or ClientSpecialisation()
         self._research_cache = ResearchCache()
         self._validator      = ForecastValidator()
-        self._classifier     = QuestionClassifier(self.get_llm("researcher", "llm"))
+        self._classifier     = QuestionClassifier(self.get_llm("classifier", "llm"))
 
         tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
         self._sources = SourceRegistry()
@@ -670,21 +708,25 @@ class Geobot(ForecastBot):
             exclude_domains=self._client_spec.excluded_domains or None,
         ))
 
-        # Register Perplexity models via OpenRouter for parallel web research
-        perplexity_models = [
-            "openrouter/perplexity/sonar-pro",
-            "openrouter/perplexity/sonar-reasoning",
-            "openrouter/perplexity/sonar",
+        # Register Perplexity sources — best models per research role
+        # sonar-pro        : rich synthesis + citations
+        # sonar-reasoning  : chain-of-thought, better for complex causal queries
+        # sonar            : fast sweep for market signals and base rates
+        perplexity_configs = [
+            ("openrouter/perplexity/sonar-pro",       0.20),   # deep synthesis
+            ("openrouter/perplexity/sonar-reasoning",  0.30),   # analytical reasoning
+            ("openrouter/perplexity/sonar",            0.15),   # fast signal sweep
         ]
-        for model in perplexity_models:
+        for model, temp in perplexity_configs:
             try:
-                perplexity_llm = GeneralLlm(model=model, temperature=0.3, timeout=45, allowed_tries=2)
-                self._sources.register(PerplexitySource(model=model, llm=perplexity_llm))
+                llm = GeneralLlm(model=model, temperature=temp, timeout=60, allowed_tries=2)
+                self._sources.register(PerplexitySource(model=model, llm=llm))
+                logger.info(f"[{BOT_NAME}] Registered research source: {model}")
             except Exception as e:
-                logger.debug(f"[Geobot] Failed to register Perplexity model {model}: {e}")
+                logger.debug(f"[{BOT_NAME}] Failed to register {model}: {e}")
 
         self._ext_cfg = ExtremizationConfig(
-            enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower() in ["1","true","yes","y"],
+            enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower() in ["1", "true", "yes", "y"],
             factor=float(os.getenv("EXTREMIZE_FACTOR", "1.45")),
             floor=float(os.getenv("EXTREMIZE_FLOOR",  "0.02")),
             ceil=float(os.getenv("EXTREMIZE_CEIL",    "0.98")),
@@ -711,7 +753,7 @@ class Geobot(ForecastBot):
         self._sources.register(source)
 
     # -------------------------------------------------------------------
-    # Throttling
+    # Throttle (search only — LLM calls are parallel)
     # -------------------------------------------------------------------
 
     async def _throttle_search(self) -> None:
@@ -721,16 +763,10 @@ class Geobot(ForecastBot):
             await asyncio.sleep(wait + random.random() * 0.15)
         self._last_search_call_ts = time.time()
 
-    async def _throttle_llm(self) -> None:
-        now  = time.time()
-        wait = (self._last_llm_call_ts + self._min_seconds_between_llm_calls) - now
-        if wait > 0:
-            await asyncio.sleep(wait + random.random() * 0.10)
-        self._last_llm_call_ts = time.time()
-
     async def _llm_invoke(self, model_key: str, prompt: str) -> str:
-        await self._throttle_llm()
-        return await self.get_llm(model_key, "llm").invoke(prompt)
+        """Invoke an LLM with automatic free-tier fallback on provider errors."""
+        llm = self.get_llm(model_key, "llm")
+        return await _invoke_with_fallback(llm, prompt, _FREE_FALLBACKS)
 
     # -------------------------------------------------------------------
     # Superforecasting preamble
@@ -771,7 +807,7 @@ class Geobot(ForecastBot):
         ).strip()
 
     # -------------------------------------------------------------------
-    # Research – adaptive, multi-source
+    # Research – PARALLEL multi-source
     # -------------------------------------------------------------------
 
     async def _decompose_question(
@@ -809,6 +845,11 @@ class Geobot(ForecastBot):
             f"{question.question_text} prediction market probability",
         ]
 
+    async def _fetch_single_query(self, query: str) -> list[str]:
+        """Fetch one query from all sources in parallel, with search throttle."""
+        await self._throttle_search()
+        return await self._sources.fetch_all(query)
+
     async def _multi_source_research_bundle(
         self, question: MetaculusQuestion, profile: QuestionProfile
     ) -> str:
@@ -824,11 +865,17 @@ class Geobot(ForecastBot):
             if q2 and q2 not in seen:
                 seen.add(q2); all_queries.append(q2)
 
+        # Run ALL queries in parallel — each query fans out to all sources simultaneously
+        query_tasks = [self._fetch_single_query(q) for q in all_queries]
+        query_results = await asyncio.gather(*query_tasks, return_exceptions=True)
+
         blocks: list[str] = []
-        for q in all_queries:
-            await self._throttle_search()
-            source_results = await self._sources.fetch_all(q)
-            blocks.extend(source_results)
+        for res in query_results:
+            if isinstance(res, list):
+                blocks.extend(res)
+            elif isinstance(res, Exception):
+                logger.debug(f"[{BOT_NAME}] Query batch error: {res}")
+
         return "\n\n".join(b for b in blocks if b.strip()).strip()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -840,7 +887,7 @@ class Geobot(ForecastBot):
             profile  = await self._classifier.classify(question)
             strategy = ModellingStrategy.select(profile)
             logger.info(
-                f"[Geobot] '{question.question_text[:60]}…' → "
+                f"[{BOT_NAME}] '{question.question_text[:60]}…' → "
                 f"domain={profile.domain} geo={profile.geography or 'global'} "
                 f"strategy={strategy}"
             )
@@ -883,7 +930,8 @@ class Geobot(ForecastBot):
                     {source_bundle}
                     """
                 ).strip() if source_bundle else f"{base}\n\n--- RESEARCH SUMMARY ---\n{summary}"
-            except Exception:
+            except Exception as exc:
+                logger.warning(f"[{BOT_NAME}] Summarizer failed: {exc}. Using raw research.")
                 final = research_raw
 
             await self._research_cache.set(question.page_url, final)
@@ -906,48 +954,40 @@ class Geobot(ForecastBot):
         return ""
 
     def _clean_reasoning_for_submission(self, reasoning: str) -> str:
-        """
-        Remove references to sources, models, and implementation details
-        before submitting reasoning to Metaculus.
-        """
+        """Remove references to internal sources and implementation details."""
         import re
-        
-        # Remove mentions of sources like "[TavilySource]", "[perplexity_sonar-pro]", etc.
         reasoning = re.sub(r'\[\w+(?:_\w+)*\]\s*', '', reasoning)
-        
-        # Remove model mentions (e.g., "using GPT-4", "via Claude", "with Perplexity")
-        reasoning = re.sub(r'(?:using|via|with|powered by|generated by)\s+\w+[\w\s]*model', '', reasoning, flags=re.IGNORECASE)
-        
-        # Remove "Query:" lines from raw search results
+        reasoning = re.sub(
+            r'(?:using|via|with|powered by|generated by)\s+\w+[\w\s]*model',
+            '', reasoning, flags=re.IGNORECASE
+        )
         reasoning = re.sub(r'Query:\s*[^\n]*\n', '', reasoning)
-        
-        # Clean up extra whitespace
         reasoning = re.sub(r'\n\s*\n+', '\n\n', reasoning)
-        reasoning = reasoning.strip()
-        
-        return reasoning
+        return reasoning.strip()
 
     def _get_community_median_context(self, question: MetaculusQuestion) -> str:
         """Extract and format the median community forecast as context."""
         try:
-            # For binary questions, try to get community prediction
             if hasattr(question, 'community_prediction') and question.community_prediction is not None:
                 median_prob = question.community_prediction
-                return f"\n## Community Median Prior\nThe median community forecast is currently: {median_prob*100:.1f}%\nUse this as a sanity check and starting anchor, adjusting based on your analysis.\n"
-            
-            # For numeric questions, try to get community estimate
+                return (
+                    f"\n## Community Median Prior\n"
+                    f"The median community forecast is currently: {median_prob*100:.1f}%\n"
+                    f"Use this as a sanity check and starting anchor, adjusting based on your analysis.\n"
+                )
             elif hasattr(question, 'community_estimate') and question.community_estimate is not None:
-                return f"\n## Community Median Prior\nThe community median estimate is: {question.community_estimate}\nUse this as a reference point for calibration.\n"
-            
-            # Fallback: try prediction_set or crowd_forecast
+                return (
+                    f"\n## Community Median Prior\n"
+                    f"The community median estimate is: {question.community_estimate}\n"
+                    f"Use this as a reference point for calibration.\n"
+                )
             elif hasattr(question, 'prediction_set') and question.prediction_set:
                 predictions = [p for p in question.prediction_set if isinstance(p, (int, float))]
                 if predictions:
-                    median = sorted(predictions)[len(predictions)//2]
+                    median = sorted(predictions)[len(predictions) // 2]
                     return f"\n## Community Median Prior\nMedian of recent forecasts: {median}\n"
         except Exception as e:
-            logger.debug(f"[Geobot] Failed to extract community median: {e}")
-        
+            logger.debug(f"[{BOT_NAME}] Failed to extract community median: {e}")
         return ""
 
     # -------------------------------------------------------------------
@@ -958,10 +998,10 @@ class Geobot(ForecastBot):
         self, question: BinaryQuestion, research: str
     ) -> ReasonedPrediction[float]:
         profile, strategy = await self._get_profile_and_strategy(question)
-        median_context = self._get_community_median_context(question)
+        median_context    = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are Geobot, a professional superforecaster.
+            You are {BOT_NAME}, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -998,10 +1038,16 @@ class Geobot(ForecastBot):
         try:
             reasoning = await self._llm_invoke("default", prompt)
         except Exception as exc:
-            logger.warning(f"[Geobot] LLM failed for {question.page_url}: {exc}. Returning 50% prior.")
-            return ReasonedPrediction(prediction_value=0.5, reasoning="LLM failed; returning uninformative prior.")
+            logger.warning(
+                f"[{BOT_NAME}] LLM failed for {question.page_url}: {exc}. "
+                "Returning 50% prior."
+            )
+            return ReasonedPrediction(
+                prediction_value=0.5,
+                reasoning="LLM failed after all fallbacks; returning uninformative prior.",
+            )
 
-        logger.info(f"[Geobot] Reasoning for {question.page_url}: {reasoning}")
+        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
         binary_prediction: BinaryPrediction = await structure_output(
             reasoning, BinaryPrediction,
             model=self.get_llm("parser", "llm"),
@@ -1021,10 +1067,10 @@ class Geobot(ForecastBot):
         self, question: MultipleChoiceQuestion, research: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         profile, strategy = await self._get_profile_and_strategy(question)
-        median_context = self._get_community_median_context(question)
+        median_context    = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are Geobot, a professional superforecaster.
+            You are {BOT_NAME}, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -1061,14 +1107,17 @@ class Geobot(ForecastBot):
         self, question: MultipleChoiceQuestion, prompt: str
     ) -> ReasonedPrediction[PredictedOptionList]:
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[Geobot] Reasoning for {question.page_url}: {reasoning}")
+        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
         predicted_option_list: PredictedOptionList = await structure_output(
             text_to_structure=reasoning, output_type=PredictedOptionList,
             model=self.get_llm("parser", "llm"),
             num_validation_samples=self._structure_output_validation_samples,
             additional_instructions=f"Option names must match one of: {question.options}. Do not drop any option.",
         )
-        return ReasonedPrediction(prediction_value=predicted_option_list, reasoning=self._clean_reasoning_for_submission(reasoning))
+        return ReasonedPrediction(
+            prediction_value=predicted_option_list,
+            reasoning=self._clean_reasoning_for_submission(reasoning),
+        )
 
     # -------------------------------------------------------------------
     # Numeric
@@ -1079,10 +1128,10 @@ class Geobot(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         profile, strategy = await self._get_profile_and_strategy(question)
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        median_context = self._get_community_median_context(question)
+        median_context       = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are Geobot, a professional superforecaster.
+            You are {BOT_NAME}, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -1124,7 +1173,7 @@ class Geobot(ForecastBot):
         self, question: NumericQuestion, prompt: str
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[Geobot] Reasoning for {question.page_url}: {reasoning}")
+        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
         percentile_list: list[Percentile] = await structure_output(
             reasoning, list[Percentile], model=self.get_llm("parser", "llm"),
             additional_instructions=(
@@ -1147,10 +1196,10 @@ class Geobot(ForecastBot):
     ) -> ReasonedPrediction[NumericDistribution]:
         profile, strategy = await self._get_profile_and_strategy(question)
         upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        median_context = self._get_community_median_context(question)
+        median_context       = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are Geobot, a professional superforecaster.
+            You are {BOT_NAME}, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -1192,7 +1241,7 @@ class Geobot(ForecastBot):
         self, question: DateQuestion, prompt: str
     ) -> ReasonedPrediction[NumericDistribution]:
         reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[Geobot] Reasoning for {question.page_url}: {reasoning}")
+        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
         date_percentile_list: list[DatePercentile] = await structure_output(
             reasoning, list[DatePercentile], model=self.get_llm("parser", "llm"),
             additional_instructions=(
@@ -1268,10 +1317,10 @@ class Geobot(ForecastBot):
         return ReasonedPrediction(
             reasoning=self._clean_reasoning_for_submission(full_reasoning),
             prediction_value=ConditionalPrediction(
-                parent=parent_info.prediction_value,          # type: ignore
-                child=child_info.prediction_value,            # type: ignore
-                prediction_yes=yes_info.prediction_value,     # type: ignore
-                prediction_no=no_info.prediction_value,       # type: ignore
+                parent=parent_info.prediction_value,
+                child=child_info.prediction_value,
+                prediction_yes=yes_info.prediction_value,
+                prediction_no=no_info.prediction_value,
             ),
         )
 
@@ -1291,10 +1340,10 @@ class Geobot(ForecastBot):
                 return (
                     ReasonedPrediction(
                         prediction_value=PredictionAffirmed(),
-                        reasoning=f"Reaffirmed at {DataOrganizer.get_readable_prediction(pf)}.",  # type: ignore
+                        reasoning=f"Reaffirmed at {DataOrganizer.get_readable_prediction(pf)}.",
                     ),
                     research,
-                )  # type: ignore
+                )
         info = await self._make_prediction(question, research)
         full_research = self._add_reasoning_to_research(research, info, question_type)
         return info, full_research  # type: ignore
@@ -1324,19 +1373,19 @@ class Geobot(ForecastBot):
         return "Forecast ONLY the CHILD question given the parent's resolution. Do not re-forecast the parent."
 
     # -------------------------------------------------------------------
-    # Extremization – top-level sweep (floats skipped; done at source)
+    # Extremization – top-level sweep
     # -------------------------------------------------------------------
 
     def _extremize_report_if_numeric(self, report: Any) -> None:
         try:
             pv = getattr(report, "prediction_value", None)
             if isinstance(pv, float):
-                return   # already extremized at point of creation
+                return  # already extremized at point of creation
             if isinstance(pv, NumericDistribution):
                 median_p     = pv.percentile_at_value(pv.median) / 100.0
                 extremized_p = extremize_probability(median_p, self._ext_cfg)
                 if abs(extremized_p - median_p) > 1e-6:
-                    logger.debug(f"[Geobot] Numeric extremization: {median_p:.3f} → {extremized_p:.3f}")
+                    logger.debug(f"[{BOT_NAME}] Numeric extremization: {median_p:.3f} → {extremized_p:.3f}")
         except Exception:
             return
 
@@ -1351,7 +1400,7 @@ class Geobot(ForecastBot):
             reports = self._extremize_reports(reports)
             summary = self._validator.summary()
             if summary:
-                logger.info(f"[Geobot] Validation summary:\n{json.dumps(summary, indent=2)}")
+                logger.info(f"[{BOT_NAME}] Validation summary:\n{json.dumps(summary, indent=2)}")
         return reports
 
     async def forecast_questions(self, *args, **kwargs):
@@ -1360,7 +1409,7 @@ class Geobot(ForecastBot):
             reports = self._extremize_reports(reports)
             summary = self._validator.summary()
             if summary:
-                logger.info(f"[Geobot] Validation summary:\n{json.dumps(summary, indent=2)}")
+                logger.info(f"[{BOT_NAME}] Validation summary:\n{json.dumps(summary, indent=2)}")
         return reports
 
 
@@ -1376,27 +1425,27 @@ if __name__ == "__main__":
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").propagate = False
 
-    parser = argparse.ArgumentParser(description="Run Geobot – the superforecaster bot")
+    parser = argparse.ArgumentParser(description=f"Run {BOT_NAME} – the superforecaster bot")
     parser.add_argument(
         "--mode", type=str,
         choices=["tournament", "metaculus_cup", "test_questions"],
         default="tournament",
     )
-    args    = parser.parse_args()
+    args     = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
     # -----------------------------------------------------------------------
     # Client specialisation – edit this block to tune for a specific client
     # -----------------------------------------------------------------------
     spec = ClientSpecialisation(
-        domain_focus=[],           # e.g. ["economics", "finance"]
-        trusted_domains=[],        # e.g. ["reuters.com", "ft.com"]
-        excluded_domains=[],       # e.g. ["reddit.com"]
-        extra_context="",          # inject proprietary intelligence here
+        domain_focus=[],
+        trusted_domains=[],
+        excluded_domains=[],
+        extra_context="",
         calibration_target=0.15,
     )
 
-    geobot = Geobot(
+    bot = Bot311(
         client_spec=spec,
         research_reports_per_question=1,
         predictions_per_research_report=3,
@@ -1407,8 +1456,8 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=False,
     )
 
-    # Create a separate bot for minibench with extremization factor 4.3
-    minibench_geobot = Geobot(
+    # Separate bot for minibench with higher extremization factor
+    minibench_bot = Bot311(
         client_spec=spec,
         research_reports_per_question=1,
         predictions_per_research_report=3,
@@ -1418,7 +1467,7 @@ if __name__ == "__main__":
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=False,
     )
-    minibench_geobot._ext_cfg = ExtremizationConfig(
+    minibench_bot._ext_cfg = ExtremizationConfig(
         enabled=True,
         factor=4.3,
         floor=0.02,
@@ -1427,21 +1476,21 @@ if __name__ == "__main__":
 
     # -----------------------------------------------------------------------
     # Register additional client sources here, e.g.:
-    #   geobot.register_source(MyProprietaryDB())
+    #   bot.register_source(MyProprietaryDB())
     # -----------------------------------------------------------------------
 
     client = MetaculusClient()
 
     if run_mode == "tournament":
-        r1 = asyncio.run(geobot.forecast_on_tournament("33022", return_exceptions=True))
-        r2 = asyncio.run(minibench_geobot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
-        r3 = asyncio.run(geobot.forecast_on_tournament("market-pulse-26q2",                   return_exceptions=True))
+        r1 = asyncio.run(bot.forecast_on_tournament("33022",                              return_exceptions=True))
+        r2 = asyncio.run(minibench_bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        r3 = asyncio.run(bot.forecast_on_tournament("market-pulse-26q2",                  return_exceptions=True))
         forecast_reports = r1 + r2 + r3
 
     elif run_mode == "metaculus_cup":
-        geobot.skip_previously_forecasted_questions = True
+        bot.skip_previously_forecasted_questions = True
         forecast_reports = asyncio.run(
-            geobot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
+            bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
         )
 
     elif run_mode == "test_questions":
@@ -1451,10 +1500,10 @@ if __name__ == "__main__":
             "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
             "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
-        geobot.skip_previously_forecasted_questions = True
+        bot.skip_previously_forecasted_questions = True
         questions        = [client.get_question_by_url(u) for u in EXAMPLE_QUESTIONS]
         forecast_reports = asyncio.run(
-            geobot.forecast_questions(questions, return_exceptions=True)
+            bot.forecast_questions(questions, return_exceptions=True)
         )
 
-    geobot.log_report_summary(forecast_reports)
+    bot.log_report_summary(forecast_reports)
