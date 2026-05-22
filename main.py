@@ -60,9 +60,7 @@ _MODEL_CLASSIFIER = "openrouter/perplexity/sonar"              # fast domain cla
 
 # Free-tier fallbacks (tried in order if primary fails)
 _FREE_FALLBACKS = [
-    "openrouter/meta-llama/llama-3.3-70b-instruct:free",
-    "openrouter/nousresearch/hermes-3-llama-3.1-405b:free",
-    "openrouter/mistralai/mistral-7b-instruct:free",
+    "openrouter/free",
 ]
 
 
