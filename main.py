@@ -677,6 +677,20 @@ class Bot311(ForecastBot):
     _min_seconds_between_search_calls = 1.2
     _last_search_call_ts = 0.0
 
+    @classmethod
+    def _llm_config_defaults(cls) -> dict:
+        """
+        Extend parent defaults with bot-specific LLM roles so ForecastBot
+        does not warn about missing keys when get_llm() is called.
+        """
+        parent_defaults = super()._llm_config_defaults()
+        extra = {
+            "classifier": {"model": _MODEL_CLASSIFIER, "temperature": 0.10, "timeout": 30},
+            "researcher":  {"model": _MODEL_RESEARCHER,  "temperature": 0.25, "timeout": 120},
+            "summarizer":  {"model": _MODEL_SUMMARIZER,  "temperature": 0.15, "timeout": 60},
+        }
+        return {**parent_defaults, **extra}
+
     def __init__(self, *args, client_spec: ClientSpecialisation | None = None, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
