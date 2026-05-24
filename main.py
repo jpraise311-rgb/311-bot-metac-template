@@ -14,6 +14,7 @@ from typing import Any, Literal
 from urllib.request import Request, urlopen
 
 import dotenv
+import numpy as np
 
 from forecasting_tools import (
     BinaryPrediction,
@@ -41,54 +42,15 @@ from forecasting_tools import (
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
-BOT_NAME = "311bot"
-
 # ---------------------------------------------------------------------------
-# Model identifiers — ALL Perplexity via OpenRouter (only allowed provider)
+# Free-tier model identifiers via OpenRouter
 # ---------------------------------------------------------------------------
-# sonar-reasoning-pro : chain-of-thought + live web (primary forecaster)
-# sonar-pro           : best synthesis + live web (research, summarizer)
-# sonar               : fast, cheap (parsing, classification)
-_MODEL_DEFAULT    = "openrouter/perplexity/sonar-reasoning-pro"  # primary forecaster
-_MODEL_SUMMARIZER = "openrouter/perplexity"            # research summariser
-_MODEL_RESEARCHER = "openrouter/perplexity/sonar-pro"            # research queries
-_MODEL_PARSER     = "openrouter/perplexity/sonar"                # fast structured extraction
-_MODEL_CLASSIFIER = "openrouter/perplexity/sonar"                # fast domain classification
+_LARGE_MODEL  = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+_MEDIUM_MODEL = "openrouter/google/gemini-2.0-flash-exp:free"
+_SMALL_MODEL  = "openrouter/meta-llama/llama-3.1-8b-instruct:free"
 
-# Fallback chain — sonar is the cheapest Perplexity tier
-_FREE_FALLBACKS = [
-    "openrouter/perplexity/sonar",
-    "openrouter/perplexity/sonar-pro",
-]
-
-
-# ===========================================================================
-# Fallback-aware LLM invoke helper
-# ===========================================================================
-
-async def _invoke_with_fallback(
-    primary_llm: GeneralLlm, prompt: str, fallback_models: list[str] | None = None
-) -> str:
-    try:
-        return await primary_llm.invoke(prompt)
-    except Exception as primary_exc:
-        err_str = str(primary_exc)
-        if fallback_models and (
-            "NotFoundError" in err_str
-            or "404" in err_str
-            or "No allowed providers" in err_str
-        ):
-            for model in fallback_models:
-                try:
-                    logger.warning(
-                        f"[{BOT_NAME}] Primary model failed ({primary_exc}), trying fallback: {model}"
-                    )
-                    fallback_llm = GeneralLlm(model=model, temperature=0.15, timeout=60, allowed_tries=2)
-                    return await fallback_llm.invoke(prompt)
-                except Exception as fb_exc:
-                    logger.warning(f"[{BOT_NAME}] Fallback {model} also failed: {fb_exc}")
-                    continue
-        raise primary_exc
+# Perplexity Sonar model via OpenRouter
+_SONAR_MODEL  = "openrouter/perplexity/sonar"
 
 
 # ===========================================================================
@@ -104,12 +66,13 @@ GEO_SCOPES = ["global", "regional", "national", "local"]
 
 @dataclass
 class QuestionProfile:
-    domain: str                  = "other"
-    geo_scope: str               = "global"
-    geography: str               = ""
-    time_horizon_days: int       = 365
-    is_quantitative: bool        = False
-    confidence_in_profile: float = 0.5  # default 0.5 so classifier failures don't gate forecasts
+    """Metadata inferred about a question before forecasting begins."""
+    domain: str                    = "other"
+    geo_scope: str                 = "global"
+    geography: str                 = ""
+    time_horizon_days: int         = 365
+    is_quantitative: bool          = False
+    confidence_in_profile: float   = 0.0
 
 
 class QuestionClassifier:
@@ -137,11 +100,11 @@ class QuestionClassifier:
             """
         )
         try:
-            raw = await _invoke_with_fallback(self._llm, prompt, _FREE_FALLBACKS)
+            raw = await self._llm.invoke(prompt)
             raw = raw.strip()
             start, end = raw.find("{"), raw.rfind("}")
             if start != -1 and end != -1:
-                raw = raw[start: end + 1]
+                raw = raw[start : end + 1]
             data = json.loads(raw)
             return QuestionProfile(
                 domain=data.get("domain", "other"),
@@ -153,8 +116,7 @@ class QuestionClassifier:
             )
         except Exception as exc:
             logger.warning(f"[Classifier] Failed to classify question: {exc}")
-            # Return 0.5 confidence so downstream gates don't block on classifier failure
-            return QuestionProfile(confidence_in_profile=0.5)
+            return QuestionProfile()
 
 
 # ===========================================================================
@@ -194,8 +156,8 @@ class ModellingStrategy:
                 ## Modelling Strategy: Analogical Reasoning{geo_ctx}
                 1. Identify 2-3 historical situations most structurally similar to this one.
                 2. How did those situations resolve? What was the base rate of the outcome?
-                3. Key SIMILARITIES to the analogies and how they support your estimate.
-                4. Key DIFFERENCES and how they require you to adjust.
+                3. Key SIMILARITIES to the analogies – and how they support your estimate.
+                4. Key DIFFERENCES – and how they require you to adjust.
                 5. Weight analogies by structural similarity, not surface resemblance.
                 """
             ).strip()
@@ -204,13 +166,17 @@ class ModellingStrategy:
             return clean_indents(
                 f"""
                 ## Modelling Strategy: Market Signal{geo_ctx}
-                1. Check whether prediction markets have a current probability on this question.
+                1. Check whether prediction markets (Metaculus community, Polymarket,
+                   Metaforecast) have a current probability on this or a related question.
                 2. If a market signal exists, treat it as a strong prior.
-                3. Adjust away from the market only if you have concrete information it hasn't priced in.
-                4. For short time horizons, the status quo is extremely sticky — weight inertia heavily.
+                3. Adjust away from the market only if you have concrete information
+                   it hasn't priced in.
+                4. For short time horizons, the status quo is extremely sticky –
+                   weight inertia very heavily.
                 """
             ).strip()
 
+        # default: base_rate
         return clean_indents(
             f"""
             ## Modelling Strategy: Base Rate{geo_ctx}
@@ -250,55 +216,68 @@ class SourceRegistry:
 
     async def fetch_all(self, query: str) -> list[str]:
         sources = self.available_sources()
-        if not sources:
-            return []
-        results = await asyncio.gather(*[s.fetch(query) for s in sources], return_exceptions=True)
+        tasks   = [s.fetch(query) for s in sources]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         blocks: list[str] = []
         for src, res in zip(sources, results):
             if isinstance(res, Exception):
-                logger.debug(f"[SourceRegistry] {src.name} failed: {res}")
+                blocks.append(f"[{src.name}] Query failed: {res}")
             elif isinstance(res, str) and res.strip():
-                blocks.append(res)  # no source tag — keeps reasoning clean
+                blocks.append(f"[{src.name}]\n{res}")
         return blocks
 
 
 # ---------------------------------------------------------------------------
-# Tavily source
+# TavilySearcher
 # ---------------------------------------------------------------------------
 
 def _format_tavily_results(query: str, results: dict[str, Any], max_results: int = 6) -> str:
     items = results.get("results", []) or []
-    lines: list[str] = []
+    lines = [f"Query: {query}"]
     for r in items[:max_results]:
         title   = (r.get("title")       or "").strip()
+        url     = (r.get("url")         or "").strip()
         snippet = (r.get("content")     or "").strip()
         raw     = (r.get("raw_content") or "").strip()
-        if title or snippet:
-            if title:
-                lines.append(f"- {title}")
+        if title or url or snippet:
+            lines.append(f"- {title}")
+            if url:
+                lines.append(f"  URL: {url}")
             if snippet:
-                lines.append(f"  {snippet}")
+                lines.append(f"  Notes: {snippet}")
             if raw and raw != snippet:
-                lines.append(f"  {raw[:1500]}")
+                lines.append(f"  Full text (truncated): {raw[:1500]}")
     return "\n".join(lines).strip()
 
 
 class TavilySearcher:
-    def __init__(self, api_key: str, max_results: int = 6, search_depth: str = "advanced",
-                 include_raw_content: bool = True, timeout_s: int = 30,
-                 include_domains: list[str] | None = None, exclude_domains: list[str] | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        max_results: int = 6,
+        search_depth: str = "advanced",
+        include_answer: bool = False,
+        include_raw_content: bool = True,
+        include_images: bool = False,
+        include_domains: list[str] | None = None,
+        exclude_domains: list[str] | None = None,
+        timeout_s: int = 30,
+    ):
         self.api_key             = api_key
         self.max_results         = max_results
         self.search_depth        = search_depth
+        self.include_answer      = include_answer
         self.include_raw_content = include_raw_content
-        self.timeout_s           = timeout_s
+        self.include_images      = include_images
         self.include_domains     = include_domains
         self.exclude_domains     = exclude_domains
+        self.timeout_s           = timeout_s
 
     def _post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(payload).encode("utf-8")
         req  = Request(url, data=data,
-                       headers={"Content-Type": "application/json", "Accept": "application/json"},
+                       headers={"Content-Type": "application/json",
+                                "Accept": "application/json"},
                        method="POST")
         with urlopen(req, timeout=self.timeout_s) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -308,9 +287,9 @@ class TavilySearcher:
             "api_key": self.api_key, "query": query,
             "max_results": self.max_results,
             "search_depth": self.search_depth,
-            "include_answer": False,
+            "include_answer": self.include_answer,
             "include_raw_content": self.include_raw_content,
-            "include_images": False,
+            "include_images": self.include_images,
         }
         if self.include_domains: payload["include_domains"] = self.include_domains
         if self.exclude_domains: payload["exclude_domains"] = self.exclude_domains
@@ -339,19 +318,26 @@ class TavilySource(BaseSource):
             results = await self._searcher.search(query)
             return _format_tavily_results(query, results, self._searcher.max_results)
         except Exception as exc:
-            return f"Search failed: {type(exc).__name__}"
+            return f"Query: {query}\n- Search failed: {type(exc).__name__}"
 
 
-class PerplexitySource(BaseSource):
+# ---------------------------------------------------------------------------
+# PerplexitySonarSource  – online research via openrouter/perplexity/sonar
+# ---------------------------------------------------------------------------
+
+class PerplexitySonarSource(BaseSource):
     """
-    Research source using Perplexity online models via OpenRouter.
-    No source tags in output — keeps reasoning first-person and clean.
+    Research source powered by Perplexity Sonar through OpenRouter.
+
+    Sonar is a real-time web-search model, so it fetches live information
+    even without a separate search API key.  Requires OPENROUTER_API_KEY
+    to be set (same key used for other OpenRouter models in this bot).
     """
 
-    def __init__(self, model: str, llm: GeneralLlm):
-        self.name   = f"perplexity_{model.split('/')[-1]}"
-        self._model = model
-        self._llm   = llm
+    name = "perplexity_sonar"
+
+    def __init__(self, llm: GeneralLlm):
+        self._llm = llm
 
     def is_available(self) -> bool:
         return self._llm is not None
@@ -360,24 +346,52 @@ class PerplexitySource(BaseSource):
         try:
             prompt = clean_indents(
                 f"""
-                Search the web and provide research findings for this forecasting query:
+                You are a research assistant with live web access.
+                Provide comprehensive, up-to-date research findings for this
+                forecasting query. Include: recent news, key statistics, expert
+                opinions, base rates, prediction market signals, and any relevant
+                historical analogues. Be information-dense and cite sources where
+                possible.
+
+                Query: {query}
+                """
+            )
+            result = await self._llm.invoke(prompt)
+            return f"Query: {query}\n\n{result}"
+        except Exception as exc:
+            return f"Query: {query}\n- Sonar research failed: {type(exc).__name__}: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# LLMResearchSource – fallback using any free LLM
+# ---------------------------------------------------------------------------
+
+class LLMResearchSource(BaseSource):
+    """Research source using a free LLM via OpenRouter."""
+
+    def __init__(self, model: str, llm: GeneralLlm):
+        self.name = f"llm_research_{model.split('/')[-1]}"
+        self._llm = llm
+
+    def is_available(self) -> bool:
+        return self._llm is not None
+
+    async def fetch(self, query: str) -> str:
+        try:
+            prompt = clean_indents(
+                f"""
+                Provide research findings for this forecasting query:
 
                 {query}
 
-                Return a concise summary of:
-                - Recent developments and trends
-                - Key statistics or data points
-                - Expert opinions or forecasts
-                - Market signals if applicable
-
-                Be information-dense. Do not mention your sources or search process.
+                Include: recent developments, key statistics, expert opinions,
+                base rates, and market signals. Be information-dense.
                 """
             )
-            result = await _invoke_with_fallback(self._llm, prompt, _FREE_FALLBACKS)
-            return result.strip() if result else ""
+            result = await self._llm.invoke(prompt)
+            return f"Query: {query}\n\n{result}"
         except Exception as exc:
-            logger.debug(f"[{self.name}] fetch failed: {type(exc).__name__}: {exc}")
-            return ""
+            return f"Query: {query}\n- Research failed: {type(exc).__name__}: {exc}"
 
 
 # ===========================================================================
@@ -400,7 +414,7 @@ class ValidationRecord:
 class ForecastValidator:
     LOW_CONFIDENCE_THRESHOLD = 0.35
 
-    def __init__(self, db_path: str = "311bot_validation.db"):
+    def __init__(self, db_path: str = "joypraise_validation.db"):
         self._db_path = db_path
         self._init_db()
 
@@ -409,48 +423,77 @@ class ForecastValidator:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS forecast_ledger (
-                    question_url TEXT, question_text TEXT, domain TEXT, geo_scope TEXT,
-                    strategy TEXT, prediction_value TEXT, confidence_score REAL,
-                    flagged INTEGER, ts REAL
+                    question_url     TEXT,
+                    question_text    TEXT,
+                    domain           TEXT,
+                    geo_scope        TEXT,
+                    strategy         TEXT,
+                    prediction_value TEXT,
+                    confidence_score REAL,
+                    flagged          INTEGER,
+                    ts               REAL
                 )
                 """
             )
             conn.commit()
 
-    def compute_confidence(self, prediction_value: Any, profile: QuestionProfile, research_length: int) -> float:
+    def compute_confidence(
+        self,
+        prediction_value: Any,
+        profile: QuestionProfile,
+        research_length: int,
+    ) -> float:
         classifier_score = profile.confidence_in_profile
         evidence_score   = min(1.0, research_length / 3000)
-        signal_score     = abs(prediction_value - 0.5) * 2 if isinstance(prediction_value, float) else 0.5
-        # Evidence carries 0.55 weight so a classifier failure doesn't gate
-        # forecasts when research is actually present
-        return round(min(1.0, max(0.0, 0.25 * classifier_score + 0.55 * evidence_score + 0.20 * signal_score)), 3)
+        if isinstance(prediction_value, float):
+            signal_score = abs(prediction_value - 0.5) * 2
+        else:
+            signal_score = 0.5
+        score = 0.40 * classifier_score + 0.35 * evidence_score + 0.25 * signal_score
+        return round(min(1.0, max(0.0, score)), 3)
 
-    def validate(self, question: MetaculusQuestion, profile: QuestionProfile, strategy: str,
-                 prediction_value: Any, research: str) -> ValidationRecord:
+    def validate(
+        self,
+        question: MetaculusQuestion,
+        profile: QuestionProfile,
+        strategy: str,
+        prediction_value: Any,
+        research: str,
+    ) -> ValidationRecord:
         confidence = self.compute_confidence(prediction_value, profile, len(research))
         flagged    = confidence < self.LOW_CONFIDENCE_THRESHOLD
         record = ValidationRecord(
-            question_url=question.page_url, question_text=question.question_text[:300],
-            domain=profile.domain, geo_scope=profile.geo_scope, strategy=strategy,
+            question_url=question.page_url,
+            question_text=question.question_text[:300],
+            domain=profile.domain,
+            geo_scope=profile.geo_scope,
+            strategy=strategy,
             prediction_value=str(prediction_value)[:200],
-            confidence_score=confidence, flagged_low_confidence=flagged,
+            confidence_score=confidence,
+            flagged_low_confidence=flagged,
         )
         self._persist(record)
         level = logging.WARNING if flagged else logging.INFO
-        logger.log(level,
+        logger.log(
+            level,
             f"[Validator] confidence={confidence:.2f} flagged={flagged} "
-            f"domain={profile.domain} strategy={strategy} | {question.page_url}")
+            f"domain={profile.domain} strategy={strategy} | {question.page_url}",
+        )
         return record
 
     def _persist(self, record: ValidationRecord) -> None:
         try:
             with sqlite3.connect(self._db_path) as conn:
                 conn.execute(
-                    "INSERT INTO forecast_ledger (question_url, question_text, domain, geo_scope, "
-                    "strategy, prediction_value, confidence_score, flagged, ts) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (record.question_url, record.question_text, record.domain, record.geo_scope,
-                     record.strategy, record.prediction_value, record.confidence_score,
-                     int(record.flagged_low_confidence), record.ts),
+                    """
+                    INSERT INTO forecast_ledger
+                    (question_url, question_text, domain, geo_scope, strategy,
+                     prediction_value, confidence_score, flagged, ts)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (record.question_url, record.question_text, record.domain,
+                     record.geo_scope, record.strategy, record.prediction_value,
+                     record.confidence_score, int(record.flagged_low_confidence), record.ts),
                 )
                 conn.commit()
         except Exception as exc:
@@ -460,10 +503,20 @@ class ForecastValidator:
         try:
             with sqlite3.connect(self._db_path) as conn:
                 rows = conn.execute(
-                    "SELECT domain, COUNT(*) as n, AVG(confidence_score) as avg_conf, "
-                    "SUM(flagged) as n_flagged FROM forecast_ledger GROUP BY domain ORDER BY n DESC"
+                    """
+                    SELECT domain, COUNT(*) as n,
+                           AVG(confidence_score) as avg_conf,
+                           SUM(flagged) as n_flagged
+                    FROM forecast_ledger GROUP BY domain ORDER BY n DESC
+                    """
                 ).fetchall()
-            return {"by_domain": [{"domain": r[0], "n": r[1], "avg_confidence": round(r[2], 3), "n_flagged": r[3]} for r in rows]}
+            return {
+                "by_domain": [
+                    {"domain": r[0], "n": r[1],
+                     "avg_confidence": round(r[2], 3), "n_flagged": r[3]}
+                    for r in rows
+                ]
+            }
         except Exception:
             return {}
 
@@ -482,31 +535,38 @@ class ClientSpecialisation:
 
 
 # ===========================================================================
-# Research cache
+# Persistent research cache (SQLite)
 # ===========================================================================
 
 class ResearchCache:
-    def __init__(self, db_path: str = "311bot_cache.db"):
+    def __init__(self, db_path: str = "joypraise_cache.db"):
         self._db_path = db_path
         self._init_db()
 
     def _init_db(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
             conn.execute(
-                "CREATE TABLE IF NOT EXISTS research_cache "
-                "(url TEXT PRIMARY KEY, content TEXT NOT NULL, ts REAL NOT NULL)"
+                """
+                CREATE TABLE IF NOT EXISTS research_cache (
+                    url TEXT PRIMARY KEY, content TEXT NOT NULL, ts REAL NOT NULL
+                )
+                """
             )
             conn.commit()
 
     def _get_sync(self, url: str) -> str | None:
         with sqlite3.connect(self._db_path) as conn:
-            row = conn.execute("SELECT content FROM research_cache WHERE url = ?", (url,)).fetchone()
+            row = conn.execute(
+                "SELECT content FROM research_cache WHERE url = ?", (url,)
+            ).fetchone()
         return row[0] if row else None
 
     def _set_sync(self, url: str, content: str) -> None:
         with sqlite3.connect(self._db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO research_cache (url, content, ts) VALUES (?, ?, ?)",
-                         (url, content, time.time()))
+            conn.execute(
+                "INSERT OR REPLACE INTO research_cache (url, content, ts) VALUES (?, ?, ?)",
+                (url, content, time.time()),
+            )
             conn.commit()
 
     async def get(self, url: str) -> str | None:
@@ -549,56 +609,97 @@ def extremize_probability(p: float, cfg: ExtremizationConfig) -> float:
 # MAIN BOT CLASS
 # ===========================================================================
 
-class Bot311(ForecastBot):
-    _max_concurrent_questions            = 3
-    _concurrency_limiter                 = asyncio.Semaphore(3)
+class Joypraise(ForecastBot):
+    """
+    Joypraise superforecaster bot.
+
+    Dynamically classifies each question (domain + geography), selects the
+    most appropriate modelling strategy, queries all registered information
+    sources in parallel (Tavily, Perplexity Sonar, free LLMs), validates
+    every forecast, and persists a calibration ledger. Accepts client-specific
+    specialisation at construction time.
+    """
+
+    _max_concurrent_questions = 3
+    _concurrency_limiter      = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
-    _min_seconds_between_search_calls    = 1.2
-    _last_search_call_ts                 = 0.0
+
+    _min_seconds_between_search_calls = 1.2
+    _min_seconds_between_llm_calls    = 0.35
+    _last_search_call_ts = 0.0
+    _last_llm_call_ts    = 0.0
+
+    def _llm_config_defaults(self) -> dict[str, str]:
+        return {
+            "summarizer":           _SMALL_MODEL,
+            "researcher":           _LARGE_MODEL,
+            "online_researcher":    _LARGE_MODEL,
+            "research_synthesizer": _MEDIUM_MODEL,
+            "pre_mortem_agent":     _MEDIUM_MODEL,
+            "parser":               _SMALL_MODEL,
+            "synthesizer_1":        _SMALL_MODEL,
+            "synthesizer_2":        _MEDIUM_MODEL,
+            "synthesizer_3":        _LARGE_MODEL,
+        }
 
     def __init__(self, *args, client_spec: ClientSpecialisation | None = None, **kwargs):
         llms = kwargs.pop("llms", None)
         if llms is None:
-            default_llm    = GeneralLlm(model=_MODEL_DEFAULT,    temperature=0.15, timeout=90,  allowed_tries=3)
-            summarizer_llm = GeneralLlm(model=_MODEL_SUMMARIZER, temperature=0.15, timeout=60,  allowed_tries=3)
-            researcher_llm = GeneralLlm(model=_MODEL_RESEARCHER, temperature=0.25, timeout=120, allowed_tries=3)
-            parser_llm     = GeneralLlm(model=_MODEL_PARSER,     temperature=0.10, timeout=45,  allowed_tries=3)
-            classifier_llm = GeneralLlm(model=_MODEL_CLASSIFIER, temperature=0.10, timeout=30,  allowed_tries=2)
+            llm_config = self._llm_config_defaults()
             llms = {
-                "default":    default_llm,
-                "summarizer": summarizer_llm,
-                "researcher": researcher_llm,
-                "parser":     parser_llm,
-                "classifier": classifier_llm,
+                key: GeneralLlm(
+                    model=model,
+                    temperature=0.15 if key in ["parser", "summarizer", "research_synthesizer"] else 0.3,
+                    timeout=60,
+                    allowed_tries=2,
+                )
+                for key, model in llm_config.items()
             }
+            llms["default"] = llms["synthesizer_2"]
         super().__init__(*args, llms=llms, **kwargs)
 
         self._client_spec    = client_spec or ClientSpecialisation()
         self._research_cache = ResearchCache()
         self._validator      = ForecastValidator()
-        self._classifier     = QuestionClassifier(self.get_llm("classifier", "llm"))
+        self._classifier     = QuestionClassifier(self.get_llm("researcher", "llm"))
 
-        tavily_key = os.getenv("TAVILY_API_KEY", "").strip()
+        # Source registry
+        tavily_key   = os.getenv("TAVILY_API_KEY", "").strip()
+        openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+
         self._sources = SourceRegistry()
+
+        # 1. Tavily web search (if key present)
         self._sources.register(TavilySource(
             api_key=tavily_key,
             include_domains=self._client_spec.trusted_domains or None,
             exclude_domains=self._client_spec.excluded_domains or None,
         ))
 
-        # Three Perplexity sources for research diversity
-        perplexity_configs = [
-            ("openrouter/perplexity/sonar-pro",            0.20),
-            ("openrouter/perplexity/sonar-reasoning-pro",  0.30),
-            ("openrouter/perplexity/sonar",                0.15),
-        ]
-        for model, temp in perplexity_configs:
+        # 2. Perplexity Sonar via OpenRouter (live web search model)
+        if openrouter_key:
             try:
-                llm = GeneralLlm(model=model, temperature=temp, timeout=60, allowed_tries=2)
-                self._sources.register(PerplexitySource(model=model, llm=llm))
+                sonar_llm = GeneralLlm(
+                    model=_SONAR_MODEL,
+                    temperature=0.2,
+                    timeout=90,
+                    allowed_tries=2,
+                )
+                self._sources.register(PerplexitySonarSource(llm=sonar_llm))
             except Exception as e:
-                logger.debug(f"[{BOT_NAME}] Failed to register {model}: {e}")
+                logger.warning(f"[Joypraise] Failed to register Perplexity Sonar: {e}")
+        else:
+            logger.info("[Joypraise] OPENROUTER_API_KEY not set – Perplexity Sonar source skipped.")
 
+        # 3. Free LLM-based research sources (fallback / ensemble diversity)
+        for model in [_LARGE_MODEL, _MEDIUM_MODEL, _SMALL_MODEL]:
+            try:
+                research_llm = GeneralLlm(model=model, temperature=0.3, timeout=60, allowed_tries=2)
+                self._sources.register(LLMResearchSource(model=model, llm=research_llm))
+            except Exception as e:
+                logger.debug(f"[Joypraise] Failed to register research model {model}: {e}")
+
+        # Extremization config
         self._ext_cfg = ExtremizationConfig(
             enabled=os.getenv("EXTREMIZE_ENABLED", "true").lower() in ["1", "true", "yes", "y"],
             factor=float(os.getenv("EXTREMIZE_FACTOR", "1.45")),
@@ -606,8 +707,28 @@ class Bot311(ForecastBot):
             ceil=float(os.getenv("EXTREMIZE_CEIL",    "0.98")),
         )
 
+    # -------------------------------------------------------------------
+    # Public API: register additional client data sources
+    # -------------------------------------------------------------------
+
     def register_source(self, source: BaseSource) -> None:
+        """
+        Register a custom data source (proprietary DB, specialised API, etc.).
+
+        Example
+        -------
+        class MyDB(BaseSource):
+            name = "my_db"
+            async def fetch(self, query: str) -> str:
+                return my_db.search(query)
+
+        bot.register_source(MyDB())
+        """
         self._sources.register(source)
+
+    # -------------------------------------------------------------------
+    # Throttling
+    # -------------------------------------------------------------------
 
     async def _throttle_search(self) -> None:
         now  = time.time()
@@ -616,9 +737,16 @@ class Bot311(ForecastBot):
             await asyncio.sleep(wait + random.random() * 0.15)
         self._last_search_call_ts = time.time()
 
+    async def _throttle_llm(self) -> None:
+        now  = time.time()
+        wait = (self._last_llm_call_ts + self._min_seconds_between_llm_calls) - now
+        if wait > 0:
+            await asyncio.sleep(wait + random.random() * 0.10)
+        self._last_llm_call_ts = time.time()
+
     async def _llm_invoke(self, model_key: str, prompt: str) -> str:
-        llm = self.get_llm(model_key, "llm")
-        return await _invoke_with_fallback(llm, prompt, _FREE_FALLBACKS)
+        await self._throttle_llm()
+        return await self.get_llm(model_key, "llm").invoke(prompt)
 
     # -------------------------------------------------------------------
     # Superforecasting preamble
@@ -628,13 +756,13 @@ class Bot311(ForecastBot):
     def _superforecasting_preamble() -> str:
         return clean_indents(
             """
-            ## Superforecasting Protocol — follow every step before giving a number
+            ## Superforecasting Protocol – follow every step before giving a number
 
             **1. Reference class first (outside view)**
             What fraction of similar past questions resolved YES (or at the predicted value)?
             Anchor your initial estimate to that base rate.
 
-            **2. Inside view — case-specific evidence**
+            **2. Inside view – case-specific evidence**
             - Causal drivers pushing toward YES / a higher value
             - Causal drivers pushing toward NO / a lower value
             - Key uncertainties that could flip the outcome
@@ -659,10 +787,12 @@ class Bot311(ForecastBot):
         ).strip()
 
     # -------------------------------------------------------------------
-    # Research — parallel multi-source
+    # Research – adaptive, multi-source
     # -------------------------------------------------------------------
 
-    async def _decompose_question(self, question: MetaculusQuestion, profile: QuestionProfile) -> list[str]:
+    async def _decompose_question(
+        self, question: MetaculusQuestion, profile: QuestionProfile
+    ) -> list[str]:
         geo_hint = f" (geography: {profile.geography})" if profile.geography else ""
         prompt = clean_indents(
             f"""
@@ -682,27 +812,25 @@ class Bot311(ForecastBot):
             raw = raw.strip()
             s, e = raw.find("["), raw.rfind("]")
             if s != -1 and e != -1:
-                raw = raw[s: e + 1]
+                raw = raw[s : e + 1]
             queries = json.loads(raw)
             if isinstance(queries, list):
                 return [q.strip() for q in queries if isinstance(q, str) and q.strip()][:6]
         except Exception:
             pass
         return [
-            f"{question.question_text} latest updates",
+            f"{question.question_text} latest updates{geo_hint}",
             f"{question.question_text} base rate historical frequency",
             f"{question.question_text} prediction market probability",
         ]
 
-    async def _fetch_single_query(self, query: str) -> list[str]:
-        await self._throttle_search()
-        return await self._sources.fetch_all(query)
-
-    async def _multi_source_research_bundle(self, question: MetaculusQuestion, profile: QuestionProfile) -> str:
-        llm_queries    = await self._decompose_question(question, profile)
+    async def _multi_source_research_bundle(
+        self, question: MetaculusQuestion, profile: QuestionProfile
+    ) -> str:
+        llm_queries = await self._decompose_question(question, profile)
         market_queries = [
+            f"metaforecast {question.question_text}",
             f"prediction market odds {question.question_text}",
-            f"expert forecast {question.question_text}",
         ]
         seen: set[str] = set()
         all_queries: list[str] = []
@@ -711,13 +839,11 @@ class Bot311(ForecastBot):
             if q2 and q2 not in seen:
                 seen.add(q2); all_queries.append(q2)
 
-        query_results = await asyncio.gather(
-            *[self._fetch_single_query(q) for q in all_queries], return_exceptions=True
-        )
         blocks: list[str] = []
-        for res in query_results:
-            if isinstance(res, list):
-                blocks.extend(res)
+        for q in all_queries:
+            await self._throttle_search()
+            source_results = await self._sources.fetch_all(q)
+            blocks.extend(source_results)
         return "\n\n".join(b for b in blocks if b.strip()).strip()
 
     async def run_research(self, question: MetaculusQuestion) -> str:
@@ -729,8 +855,9 @@ class Bot311(ForecastBot):
             profile  = await self._classifier.classify(question)
             strategy = ModellingStrategy.select(profile)
             logger.info(
-                f"[{BOT_NAME}] '{question.question_text[:60]}…' → "
-                f"domain={profile.domain} strategy={strategy}"
+                f"[Joypraise] '{question.question_text[:60]}…' → "
+                f"domain={profile.domain} geo={profile.geography or 'global'} "
+                f"strategy={strategy}"
             )
 
             base = clean_indents(
@@ -742,89 +869,148 @@ class Bot311(ForecastBot):
             ).strip()
 
             source_bundle = await self._multi_source_research_bundle(question, profile)
-            research_raw  = f"{base}\n\n{source_bundle}" if source_bundle else base
+            research_raw  = (
+                f"{base}\n\n--- MULTI-SOURCE RESEARCH ---\n{source_bundle}"
+                if source_bundle else base
+            )
 
             summarize_prompt = clean_indents(
                 f"""
-                Summarize the most relevant evidence for forecasting this question.
-                Include: status quo, key drivers, base rates, timelines, and any
-                prediction market or expert probability estimates.
-                Be concise but information-dense. Do not mention tools or search processes.
+                Summarize the most relevant evidence for forecasting this {profile.domain} question
+                (geography: {profile.geography or 'global'}).
+                Include: status quo, key drivers, base rates, timelines, and market probabilities.
+                Be concise but information-dense.
 
                 {research_raw}
                 """
             )
             try:
                 summary = await self._llm_invoke("summarizer", summarize_prompt)
-                final = (
-                    f"{base}\n\n--- RESEARCH SUMMARY ---\n{summary}\n\n"
-                    f"--- BACKGROUND ---\n{source_bundle}"
-                    if source_bundle
-                    else f"{base}\n\n--- RESEARCH SUMMARY ---\n{summary}"
-                )
-            except Exception as exc:
-                logger.warning(f"[{BOT_NAME}] Could not summarize research: {exc}. Using raw.")
+                final = clean_indents(
+                    f"""
+                    {base}
+
+                    --- RESEARCH SUMMARY ---
+                    {summary}
+
+                    --- RAW RESEARCH ---
+                    {source_bundle}
+                    """
+                ).strip() if source_bundle else f"{base}\n\n--- RESEARCH SUMMARY ---\n{summary}"
+            except Exception:
                 final = research_raw
 
             await self._research_cache.set(question.page_url, final)
             return final
 
     # -------------------------------------------------------------------
-    # Helpers
+    # Internal helpers
     # -------------------------------------------------------------------
 
-    async def _get_profile_and_strategy(self, question: MetaculusQuestion) -> tuple[QuestionProfile, str]:
+    async def _get_profile_and_strategy(
+        self, question: MetaculusQuestion
+    ) -> tuple[QuestionProfile, str]:
         profile  = await self._classifier.classify(question)
         strategy = ModellingStrategy.select(profile)
         return profile, strategy
 
     def _client_context_block(self) -> str:
         if self._client_spec.extra_context:
-            return f"\n## Additional Context\n{self._client_spec.extra_context}\n"
+            return f"\n## Client Context\n{self._client_spec.extra_context}\n"
         return ""
-
-    def _clean_reasoning(self, reasoning: str) -> str:
-        """
-        Strip any source tags, tool names, query lines, or model references so
-        the published comment reads as natural first-person reasoning.
-        """
-        import re
-        # Remove bracketed source tags like [tavily_web], [perplexity_sonar-pro], etc.
-        reasoning = re.sub(r'\[[^\]]{3,40}\]\s*', '', reasoning)
-        # Remove "Query: ..." lines
-        reasoning = re.sub(r'Query:\s*[^\n]*\n?', '', reasoning)
-        # Remove "using/via/powered by <model>" phrases
-        reasoning = re.sub(r'(?:using|via|with|powered by|generated by)\s+[\w\s\-\.]{3,30}model',
-                           '', reasoning, flags=re.IGNORECASE)
-        # Remove "--- RESEARCH SUMMARY ---" and similar headers
-        reasoning = re.sub(r'---+\s*[\w\s]+\s*---+', '', reasoning)
-        # Collapse excess blank lines
-        reasoning = re.sub(r'\n\s*\n+', '\n\n', reasoning)
-        return reasoning.strip()
 
     def _get_community_median_context(self, question: MetaculusQuestion) -> str:
         try:
-            if hasattr(question, 'community_prediction') and question.community_prediction is not None:
+            if hasattr(question, "community_prediction") and question.community_prediction is not None:
                 return (
-                    f"\n## Community Median\n"
-                    f"The current community median is {question.community_prediction * 100:.1f}%. "
-                    f"Use this as a calibration anchor.\n"
+                    f"\n## Community Median Prior\n"
+                    f"The median community forecast is currently: {question.community_prediction*100:.1f}%\n"
+                    f"Use this as a sanity check and starting anchor.\n"
                 )
+            if hasattr(question, "community_estimate") and question.community_estimate is not None:
+                return (
+                    f"\n## Community Median Prior\n"
+                    f"The community median estimate is: {question.community_estimate}\n"
+                )
+            if hasattr(question, "prediction_set") and question.prediction_set:
+                predictions = [p for p in question.prediction_set if isinstance(p, (int, float))]
+                if predictions:
+                    median = sorted(predictions)[len(predictions) // 2]
+                    return f"\n## Community Median Prior\nMedian of recent forecasts: {median}\n"
+        except Exception as e:
+            logger.debug(f"[Joypraise] Failed to extract community median: {e}")
+        return ""
+
+    def _prediction_to_str(self, prediction_value: Any) -> str:
+        """Convert a prediction to a human-readable string for submission comments."""
+        if isinstance(prediction_value, float):
+            return f"{prediction_value * 100:.1f}%"
+        try:
+            if isinstance(prediction_value, PredictedOptionList):
+                best = max(prediction_value.predicted_options, key=lambda x: x["probability"])
+                return f"'{best['option']}' ({best['probability']*100:.1f}%)"
+            if isinstance(prediction_value, NumericDistribution):
+                return f"median ≈ {prediction_value.median}"
         except Exception:
             pass
-        return ""
+        return str(prediction_value)[:120]
+
+    async def _make_submission_comment(
+        self, full_reasoning: str, prediction_value: Any, strategy: str
+    ) -> str:
+        """
+        Generate a brief first-person Metaculus comment (2-3 sentences).
+        States the approach used, the decisive factors, and the final answer.
+        """
+        pred_str = self._prediction_to_str(prediction_value)
+        prompt = clean_indents(
+            f"""
+            Write a 2-3 sentence first-person Metaculus forecast comment.
+            Requirements:
+            - First person ("I assessed...", "I applied...", "I estimated...", etc.)
+            - Name the forecasting approach: {strategy}
+            - Mention the 1-2 most decisive factors driving the estimate
+            - End with the final answer: {pred_str}
+            - Plain text only — no bullet points, no markdown headers, no bold text
+            - Be direct and specific
+
+            Full reasoning to draw from:
+            {full_reasoning[:2500]}
+            """
+        )
+        try:
+            return (await self._llm_invoke("summarizer", prompt)).strip()
+        except Exception:
+            return (
+                f"I applied a {strategy} framework to this question, weighing the key available evidence. "
+                f"My final estimate is {pred_str}."
+            )
+
+    def _get_synth_models_for_question(self, question: MetaculusQuestion) -> list[str]:
+        """Select synthesizer models based on question content."""
+        text = question.question_text.lower()
+
+        if any(kw in text for kw in ["yield", "spread", "stock", "nvidia", "apple",
+                                      "nasdaq", "s&p", "futures", "oil", "market", "price"]):
+            return ["synthesizer_3", "synthesizer_2"]
+
+        if "extinction" in text or "population" in text or "existential" in text:
+            return ["synthesizer_2", "synthesizer_1"]
+
+        return ["synthesizer_1", "synthesizer_2", "synthesizer_3"]
 
     # -------------------------------------------------------------------
     # Binary
     # -------------------------------------------------------------------
 
-    async def _run_forecast_on_binary(self, question: BinaryQuestion, research: str) -> ReasonedPrediction[float]:
+    async def _run_forecast_on_binary(
+        self, question: BinaryQuestion, research: str
+    ) -> ReasonedPrediction[float]:
         profile, strategy = await self._get_profile_and_strategy(question)
         median_context    = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are a professional superforecaster. Write your reasoning in first person.
-            Do not mention any tools, search engines, models, or data sources by name.
+            You are Joypraise, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -840,7 +1026,7 @@ class Bot311(ForecastBot):
             Today is {datetime.now().strftime("%Y-%m-%d")}.
             {median_context}
 
-            Reason step-by-step in first person:
+            Reason step-by-step:
             (a) Reference class and base rate
             (b) Time left until resolution
             (c) Status quo if nothing changes
@@ -851,41 +1037,58 @@ class Bot311(ForecastBot):
             End with: "Probability: ZZ%" (0-100)
             """
         )
-        result = await self._binary_prompt_to_forecast(question, prompt)
+        result = await self._binary_prompt_to_forecast_ensemble(question, prompt)
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
-        return result
+        brief = await self._make_submission_comment(result.reasoning, result.prediction_value, strategy)
+        return ReasonedPrediction(prediction_value=result.prediction_value, reasoning=brief)
 
-    async def _binary_prompt_to_forecast(self, question: BinaryQuestion, prompt: str) -> ReasonedPrediction[float]:
-        try:
-            reasoning = await self._llm_invoke("default", prompt)
-        except Exception as exc:
-            logger.warning(f"[{BOT_NAME}] LLM failed for {question.page_url}: {exc}. Returning 50% prior.")
+    async def _binary_prompt_to_forecast_ensemble(
+        self, question: BinaryQuestion, prompt: str
+    ) -> ReasonedPrediction[float]:
+        synthesizers   = self._get_synth_models_for_question(question)
+        forecasts      = []
+        reasoning_parts = []
+
+        for synth_key in synthesizers:
+            try:
+                reasoning = await self._llm_invoke(synth_key, prompt)
+                logger.info(f"[Joypraise] {synth_key} → {question.page_url}: {reasoning[:200]}...")
+                reasoning_parts.append(reasoning)
+
+                binary_prediction: BinaryPrediction = await structure_output(
+                    reasoning, BinaryPrediction,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+                forecasts.append(max(0.01, min(0.99, binary_prediction.prediction_in_decimal)))
+            except Exception as exc:
+                logger.warning(f"[Joypraise] {synth_key} failed for {question.page_url}: {exc}")
+
+        if not forecasts:
+            logger.warning(f"[Joypraise] All synthesizers failed for {question.page_url}.")
             return ReasonedPrediction(
                 prediction_value=0.5,
-                reasoning="I don't have enough information to forecast this question confidently, so I'm deferring to an uninformative prior of 50%.",
+                reasoning="All synthesizers failed; returning uninformative prior.",
             )
-        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
-        binary_prediction: BinaryPrediction = await structure_output(
-            reasoning, BinaryPrediction, model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        raw_p = max(0.01, min(0.99, binary_prediction.prediction_in_decimal))
+
+        raw_p = float(np.median(forecasts))
         return ReasonedPrediction(
             prediction_value=extremize_probability(raw_p, self._ext_cfg),
-            reasoning=self._clean_reasoning(reasoning),
+            reasoning="\n\n".join(reasoning_parts),
         )
 
     # -------------------------------------------------------------------
     # Multiple choice
     # -------------------------------------------------------------------
 
-    async def _run_forecast_on_multiple_choice(self, question: MultipleChoiceQuestion, research: str) -> ReasonedPrediction[PredictedOptionList]:
+    async def _run_forecast_on_multiple_choice(
+        self, question: MultipleChoiceQuestion, research: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
         profile, strategy = await self._get_profile_and_strategy(question)
         median_context    = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are a professional superforecaster. Write your reasoning in first person.
-            Do not mention any tools, search engines, models, or data sources by name.
+            You are Joypraise, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -902,9 +1105,10 @@ class Bot311(ForecastBot):
             Today is {datetime.now().strftime("%Y-%m-%d")}.
             {median_context}
 
-            Reason step-by-step in first person:
-            (a) Base rate for each option  (b) Status quo anchor
-            (c) Inside-view drivers  (d) Plausible surprise  (e) Bias check
+            Reason step-by-step:
+            (a) Base rate – how often does each option type win?
+            (b) Status quo anchor  (c) Inside-view drivers
+            (d) Plausible surprise outcome  (e) Bias check
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             Avoid assigning 0% unless logically impossible.
@@ -913,36 +1117,88 @@ class Bot311(ForecastBot):
             Option_A: Probability_A ...
             """
         )
-        result = await self._multiple_choice_prompt_to_forecast(question, prompt)
+        result = await self._multiple_choice_prompt_to_forecast_ensemble(question, prompt)
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
-        return result
+        brief = await self._make_submission_comment(result.reasoning, result.prediction_value, strategy)
+        return ReasonedPrediction(prediction_value=result.prediction_value, reasoning=brief)
 
-    async def _multiple_choice_prompt_to_forecast(self, question: MultipleChoiceQuestion, prompt: str) -> ReasonedPrediction[PredictedOptionList]:
-        reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
-        predicted_option_list: PredictedOptionList = await structure_output(
-            text_to_structure=reasoning, output_type=PredictedOptionList,
-            model=self.get_llm("parser", "llm"),
-            num_validation_samples=self._structure_output_validation_samples,
-            additional_instructions=f"Option names must match one of: {question.options}. Do not drop any option.",
-        )
+    async def _multiple_choice_prompt_to_forecast_ensemble(
+        self, question: MultipleChoiceQuestion, prompt: str
+    ) -> ReasonedPrediction[PredictedOptionList]:
+        synthesizers    = self._get_synth_models_for_question(question)
+        all_predictions = []
+        reasoning_parts = []
+
+        for synth_key in synthesizers:
+            try:
+                reasoning = await self._llm_invoke(synth_key, prompt)
+                logger.info(f"[Joypraise] {synth_key} → {question.page_url}: {reasoning[:200]}...")
+                reasoning_parts.append(reasoning)
+
+                predicted_option_list: PredictedOptionList = await structure_output(
+                    text_to_structure=reasoning, output_type=PredictedOptionList,
+                    model=self.get_llm("parser", "llm"),
+                    num_validation_samples=self._structure_output_validation_samples,
+                    additional_instructions=(
+                        f"Option names must match one of: {question.options}. "
+                        "Do not drop any option."
+                    ),
+                )
+                all_predictions.append(predicted_option_list)
+            except Exception as exc:
+                logger.warning(f"[Joypraise] {synth_key} failed for {question.page_url}: {exc}")
+
+        if not all_predictions:
+            logger.warning(f"[Joypraise] All synthesizers failed for {question.page_url}.")
+            uniform_prob = 1.0 / len(question.options)
+            fallback = PredictedOptionList(
+                [{"option": opt, "probability": uniform_prob} for opt in question.options]
+            )
+            return ReasonedPrediction(
+                prediction_value=fallback,
+                reasoning="All synthesizers failed; returning uniform distribution.",
+            )
+
+        ensemble_prob_map: dict[str, list[float]] = {opt: [] for opt in question.options}
+        for pred_list in all_predictions:
+            for item in pred_list.predicted_options:
+                if item["option"] in ensemble_prob_map:
+                    ensemble_prob_map[item["option"]].append(item["probability"])
+
+        final_predictions = []
+        for opt in question.options:
+            median_prob = (
+                float(np.median(ensemble_prob_map[opt]))
+                if ensemble_prob_map[opt]
+                else 1.0 / len(question.options)
+            )
+            final_predictions.append({"option": opt, "probability": median_prob})
+
+        total = sum(p["probability"] for p in final_predictions)
+        if total > 0:
+            final_predictions = [
+                {"option": p["option"], "probability": p["probability"] / total}
+                for p in final_predictions
+            ]
+
         return ReasonedPrediction(
-            prediction_value=predicted_option_list,
-            reasoning=self._clean_reasoning(reasoning),
+            prediction_value=PredictedOptionList(final_predictions),
+            reasoning="\n\n".join(reasoning_parts),
         )
 
     # -------------------------------------------------------------------
     # Numeric
     # -------------------------------------------------------------------
 
-    async def _run_forecast_on_numeric(self, question: NumericQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        profile, strategy = await self._get_profile_and_strategy(question)
-        upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        median_context       = self._get_community_median_context(question)
+    async def _run_forecast_on_numeric(
+        self, question: NumericQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        profile, strategy         = await self._get_profile_and_strategy(question)
+        upper_msg, lower_msg      = self._create_upper_and_lower_bound_messages(question)
+        median_context            = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are a professional superforecaster. Write your reasoning in first person.
-            Do not mention any tools, search engines, models, or data sources by name.
+            You are Joypraise, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -961,13 +1217,13 @@ class Bot311(ForecastBot):
             {upper_msg}
             {median_context}
 
-            No scientific notation. Percentiles must be strictly increasing.
+            Formatting: no scientific notation; percentiles must be strictly increasing.
 
-            Reason step-by-step in first person:
+            Reason step-by-step:
             (a) Reference class and base rate  (b) Status quo/trend anchor
             (c) Factors pushing higher  (d) Factors pushing lower
             (e) Expert/market expectations  (f) Tail scenarios
-            (g) Bias check — are my intervals too narrow?
+            (g) Bias check – intervals too narrow?
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
@@ -976,38 +1232,79 @@ class Bot311(ForecastBot):
             Percentile 60: XX  Percentile 80: XX  Percentile 90: XX
             """
         )
-        result = await self._numeric_prompt_to_forecast(question, prompt)
+        result = await self._numeric_prompt_to_forecast_ensemble(question, prompt)
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
-        return result
+        brief = await self._make_submission_comment(result.reasoning, result.prediction_value, strategy)
+        return ReasonedPrediction(prediction_value=result.prediction_value, reasoning=brief)
 
-    async def _numeric_prompt_to_forecast(self, question: NumericQuestion, prompt: str) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
-        percentile_list: list[Percentile] = await structure_output(
-            reasoning, list[Percentile], model=self.get_llm("parser", "llm"),
-            additional_instructions=(
-                f'Parse a numeric percentile forecast for: "{question.question_text}"\n'
-                f"Units: {question.unit_of_measure}. Convert units if needed."
-            ),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
+    async def _numeric_prompt_to_forecast_ensemble(
+        self, question: NumericQuestion, prompt: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        synthesizers    = self._get_synth_models_for_question(question)
+        all_percentiles = []
+        reasoning_parts = []
+
+        for synth_key in synthesizers:
+            try:
+                reasoning = await self._llm_invoke(synth_key, prompt)
+                logger.info(f"[Joypraise] {synth_key} → {question.page_url}: {reasoning[:200]}...")
+                reasoning_parts.append(reasoning)
+
+                percentile_list: list[Percentile] = await structure_output(
+                    reasoning, list[Percentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=(
+                        f'Parse a numeric percentile forecast for: "{question.question_text}"\n'
+                        f"Units: {question.unit_of_measure}. Convert units if needed."
+                    ),
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+                all_percentiles.append(percentile_list)
+            except Exception as exc:
+                logger.warning(f"[Joypraise] {synth_key} failed for {question.page_url}: {exc}")
+
+        if not all_percentiles:
+            logger.warning(f"[Joypraise] All synthesizers failed for {question.page_url}.")
+            return ReasonedPrediction(
+                prediction_value=NumericDistribution.from_question(
+                    [Percentile(percentile=0.1, value=0),
+                     Percentile(percentile=0.5, value=0.5),
+                     Percentile(percentile=0.9, value=1.0)],
+                    question,
+                ),
+                reasoning="All synthesizers failed; returning fallback distribution.",
+            )
+
+        target_percentiles = [p.percentile for p in all_percentiles[0]]
+        aggregated = []
+        for target_p in target_percentiles:
+            values = []
+            for plist in all_percentiles:
+                for p in plist:
+                    if abs(p.percentile - target_p) < 0.01:
+                        values.append(p.value)
+                        break
+            if values:
+                aggregated.append(Percentile(percentile=target_p, value=float(np.median(values))))
+
         return ReasonedPrediction(
-            prediction_value=NumericDistribution.from_question(percentile_list, question),
-            reasoning=self._clean_reasoning(reasoning),
+            prediction_value=NumericDistribution.from_question(aggregated, question),
+            reasoning="\n\n".join(reasoning_parts),
         )
 
     # -------------------------------------------------------------------
     # Date
     # -------------------------------------------------------------------
 
-    async def _run_forecast_on_date(self, question: DateQuestion, research: str) -> ReasonedPrediction[NumericDistribution]:
-        profile, strategy = await self._get_profile_and_strategy(question)
-        upper_msg, lower_msg = self._create_upper_and_lower_bound_messages(question)
-        median_context       = self._get_community_median_context(question)
+    async def _run_forecast_on_date(
+        self, question: DateQuestion, research: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        profile, strategy         = await self._get_profile_and_strategy(question)
+        upper_msg, lower_msg      = self._create_upper_and_lower_bound_messages(question)
+        median_context            = self._get_community_median_context(question)
         prompt = clean_indents(
             f"""
-            You are a professional superforecaster. Write your reasoning in first person.
-            Do not mention any tools, search engines, models, or data sources by name.
+            You are Joypraise, a professional superforecaster.
             {self._client_context_block()}
             {self._superforecasting_preamble()}
 
@@ -1025,12 +1322,13 @@ class Bot311(ForecastBot):
             {upper_msg}
             {median_context}
 
-            Dates must be YYYY-MM-DD. Percentiles must be chronological and strictly increasing.
+            Formatting: dates must be YYYY-MM-DD; percentiles chronological and strictly increasing.
 
-            Reason step-by-step in first person:
+            Reason step-by-step:
             (a) Historical duration of similar events  (b) Time already elapsed
             (c) Accelerating factors  (d) Delaying factors
-            (e) Expert/market timing expectations  (f) Tail scenarios  (g) Anchoring bias check
+            (e) Expert/market timing expectations
+            (f) Tail scenarios  (g) Anchoring bias check
 
             {self._get_conditional_disclaimer_if_necessary(question)}
 
@@ -1040,35 +1338,74 @@ class Bot311(ForecastBot):
             Percentile 80: YYYY-MM-DD  Percentile 90: YYYY-MM-DD
             """
         )
-        result = await self._date_prompt_to_forecast(question, prompt)
+        result = await self._date_prompt_to_forecast_ensemble(question, prompt)
         self._validator.validate(question, profile, strategy, result.prediction_value, research)
-        return result
+        brief = await self._make_submission_comment(result.reasoning, result.prediction_value, strategy)
+        return ReasonedPrediction(prediction_value=result.prediction_value, reasoning=brief)
 
-    async def _date_prompt_to_forecast(self, question: DateQuestion, prompt: str) -> ReasonedPrediction[NumericDistribution]:
-        reasoning = await self._llm_invoke("default", prompt)
-        logger.info(f"[{BOT_NAME}] Reasoning for {question.page_url}: {reasoning}")
-        date_percentile_list: list[DatePercentile] = await structure_output(
-            reasoning, list[DatePercentile], model=self.get_llm("parser", "llm"),
-            additional_instructions=(
-                f'Parse a date percentile forecast for: "{question.question_text}"\n'
-                "Assume midnight UTC if no time given."
-            ),
-            num_validation_samples=self._structure_output_validation_samples,
-        )
-        percentile_list = [
-            Percentile(percentile=p.percentile, value=p.value.timestamp())
-            for p in date_percentile_list
-        ]
+    async def _date_prompt_to_forecast_ensemble(
+        self, question: DateQuestion, prompt: str
+    ) -> ReasonedPrediction[NumericDistribution]:
+        synthesizers    = self._get_synth_models_for_question(question)
+        all_percentiles = []
+        reasoning_parts = []
+
+        for synth_key in synthesizers:
+            try:
+                reasoning = await self._llm_invoke(synth_key, prompt)
+                logger.info(f"[Joypraise] {synth_key} → {question.page_url}: {reasoning[:200]}...")
+                reasoning_parts.append(reasoning)
+
+                date_percentile_list: list[DatePercentile] = await structure_output(
+                    reasoning, list[DatePercentile],
+                    model=self.get_llm("parser", "llm"),
+                    additional_instructions=(
+                        f'Parse a date percentile forecast for: "{question.question_text}"\n'
+                        "Assume midnight UTC if no time given."
+                    ),
+                    num_validation_samples=self._structure_output_validation_samples,
+                )
+                all_percentiles.append(date_percentile_list)
+            except Exception as exc:
+                logger.warning(f"[Joypraise] {synth_key} failed for {question.page_url}: {exc}")
+
+        if not all_percentiles:
+            logger.warning(f"[Joypraise] All synthesizers failed for {question.page_url}.")
+            mid_ts = (question.lower_bound.timestamp() + question.upper_bound.timestamp()) / 2
+            return ReasonedPrediction(
+                prediction_value=NumericDistribution.from_question(
+                    [Percentile(percentile=0.1, value=question.lower_bound.timestamp()),
+                     Percentile(percentile=0.5, value=mid_ts),
+                     Percentile(percentile=0.9, value=question.upper_bound.timestamp())],
+                    question,
+                ),
+                reasoning="All synthesizers failed; returning fallback distribution.",
+            )
+
+        target_percentiles = [p.percentile for p in all_percentiles[0]]
+        aggregated = []
+        for target_p in target_percentiles:
+            timestamps = []
+            for plist in all_percentiles:
+                for p in plist:
+                    if abs(p.percentile - target_p) < 0.01:
+                        timestamps.append(p.value.timestamp())
+                        break
+            if timestamps:
+                aggregated.append(Percentile(percentile=target_p, value=float(np.median(timestamps))))
+
         return ReasonedPrediction(
-            prediction_value=NumericDistribution.from_question(percentile_list, question),
-            reasoning=self._clean_reasoning(reasoning),
+            prediction_value=NumericDistribution.from_question(aggregated, question),
+            reasoning="\n\n".join(reasoning_parts),
         )
 
     # -------------------------------------------------------------------
     # Bound helpers
     # -------------------------------------------------------------------
 
-    def _create_upper_and_lower_bound_messages(self, question: NumericQuestion | DateQuestion) -> tuple[str, str]:
+    def _create_upper_and_lower_bound_messages(
+        self, question: NumericQuestion | DateQuestion
+    ) -> tuple[str, str]:
         if isinstance(question, NumericQuestion):
             upper = question.nominal_upper_bound if question.nominal_upper_bound is not None else question.upper_bound
             lower = question.nominal_lower_bound if question.nominal_lower_bound is not None else question.lower_bound
@@ -1079,6 +1416,7 @@ class Bot311(ForecastBot):
             unit  = ""
         else:
             raise ValueError()
+
         upper_msg = (
             f"The question creator thinks the value is likely not higher than {upper} {unit}."
             if question.open_upper_bound else
@@ -1095,7 +1433,9 @@ class Bot311(ForecastBot):
     # Conditional
     # -------------------------------------------------------------------
 
-    async def _run_forecast_on_conditional(self, question: ConditionalQuestion, research: str) -> ReasonedPrediction[ConditionalPrediction]:
+    async def _run_forecast_on_conditional(
+        self, question: ConditionalQuestion, research: str
+    ) -> ReasonedPrediction[ConditionalPrediction]:
         parent_info, full_research = await self._get_question_prediction_info(question.parent,       research,      "parent")
         child_info,  full_research = await self._get_question_prediction_info(question.child,        full_research, "child")
         yes_info,    full_research = await self._get_question_prediction_info(question.question_yes, full_research, "yes")
@@ -1104,52 +1444,64 @@ class Bot311(ForecastBot):
         for info in [parent_info, child_info, yes_info, no_info]:
             pv = getattr(info, "prediction_value", None)
             if isinstance(pv, float):
-                info.prediction_value = extremize_probability(pv, self._ext_cfg)  # type: ignore
+                info.prediction_value = extremize_probability(pv, self._ext_cfg)  # type: ignore[attr-defined]
 
-        full_reasoning = "\n\n".join([
-            f"On the parent question: {parent_info.reasoning}",
-            f"On the child question: {child_info.reasoning}",
-            f"If yes: {yes_info.reasoning}",
-            f"If no: {no_info.reasoning}",
-        ])
-        return ReasonedPrediction(
-            reasoning=self._clean_reasoning(full_reasoning),
-            prediction_value=ConditionalPrediction(
-                parent=parent_info.prediction_value,
-                child=child_info.prediction_value,
-                prediction_yes=yes_info.prediction_value,
-                prediction_no=no_info.prediction_value,
-            ),
+        cond_pred = ConditionalPrediction(
+            parent=parent_info.prediction_value,          # type: ignore
+            child=child_info.prediction_value,            # type: ignore
+            prediction_yes=yes_info.prediction_value,     # type: ignore
+            prediction_no=no_info.prediction_value,       # type: ignore
         )
+        full_reasoning = clean_indents(
+            f"""
+            ## Parent Reasoning\n{parent_info.reasoning}
+            ## Child Reasoning\n{child_info.reasoning}
+            ## Yes Reasoning\n{yes_info.reasoning}
+            ## No Reasoning\n{no_info.reasoning}
+            """
+        ).strip()
+        brief = await self._make_submission_comment(full_reasoning, str(cond_pred)[:120], "base_rate")
+        return ReasonedPrediction(reasoning=brief, prediction_value=cond_pred)
 
-    async def _get_question_prediction_info(self, question: MetaculusQuestion, research: str, question_type: str) -> tuple[ReasonedPrediction[PredictionTypes | PredictionAffirmed], str]:
+    async def _get_question_prediction_info(
+        self, question: MetaculusQuestion, research: str, question_type: str
+    ) -> tuple[ReasonedPrediction[PredictionTypes | PredictionAffirmed], str]:
         from forecasting_tools.data_models.data_organizer import DataOrganizer
+
         previous_forecasts = question.previous_forecasts
-        if (question_type in ["parent", "child"] and previous_forecasts
-                and question_type not in self.force_reforecast_in_conditional):
+        if (
+            question_type in ["parent", "child"]
+            and previous_forecasts
+            and question_type not in self.force_reforecast_in_conditional
+        ):
             pf = previous_forecasts[-1]
             if pf.timestamp_end is None or pf.timestamp_end > datetime.now(timezone.utc):
                 return (
                     ReasonedPrediction(
                         prediction_value=PredictionAffirmed(),
-                        reasoning=f"I'm reaffirming my previous forecast of {DataOrganizer.get_readable_prediction(pf)}.",
+                        reasoning=f"Reaffirmed at {DataOrganizer.get_readable_prediction(pf)}.",  # type: ignore
                     ),
                     research,
-                )
+                )  # type: ignore
         info = await self._make_prediction(question, research)
         full_research = self._add_reasoning_to_research(research, info, question_type)
         return info, full_research  # type: ignore
 
-    def _add_reasoning_to_research(self, research: str, reasoning: ReasonedPrediction[PredictionTypes], question_type: str) -> str:
+    def _add_reasoning_to_research(
+        self, research: str, reasoning: ReasonedPrediction[PredictionTypes], question_type: str
+    ) -> str:
         from forecasting_tools.data_models.data_organizer import DataOrganizer
         qt = question_type.title()
         return clean_indents(
             f"""
             {research}
             ---
-            ## {qt} Question
+            ## {qt} Question Information
             Previously forecasted to: {DataOrganizer.get_readable_prediction(reasoning.prediction_value)}
-            Reasoning: {reasoning.reasoning}
+            Reasoning:
+            ```
+            {reasoning.reasoning}
+            ```
             Do NOT re-forecast the {qt} question.
             """
         ).strip()
@@ -1160,23 +1512,43 @@ class Bot311(ForecastBot):
         return "Forecast ONLY the CHILD question given the parent's resolution. Do not re-forecast the parent."
 
     # -------------------------------------------------------------------
-    # Tournament hooks
+    # Extremization
     # -------------------------------------------------------------------
+
+    def _extremize_report_if_numeric(self, report: Any) -> None:
+        try:
+            pv = getattr(report, "prediction_value", None)
+            if isinstance(pv, float):
+                return   # already extremized at creation
+            if isinstance(pv, NumericDistribution):
+                median_p     = pv.percentile_at_value(pv.median) / 100.0
+                extremized_p = extremize_probability(median_p, self._ext_cfg)
+                if abs(extremized_p - median_p) > 1e-6:
+                    logger.debug(f"[Joypraise] Numeric extremization: {median_p:.3f} → {extremized_p:.3f}")
+        except Exception:
+            return
+
+    def _extremize_reports(self, forecast_reports: list[Any]) -> list[Any]:
+        for r in forecast_reports:
+            self._extremize_report_if_numeric(r)
+        return forecast_reports
 
     async def forecast_on_tournament(self, *args, **kwargs):
         reports = await super().forecast_on_tournament(*args, **kwargs)
         if isinstance(reports, list):
+            reports = self._extremize_reports(reports)
             summary = self._validator.summary()
             if summary:
-                logger.info(f"[{BOT_NAME}] Validation summary:\n{json.dumps(summary, indent=2)}")
+                logger.info(f"[Joypraise] Validation summary:\n{json.dumps(summary, indent=2)}")
         return reports
 
     async def forecast_questions(self, *args, **kwargs):
         reports = await super().forecast_questions(*args, **kwargs)
         if isinstance(reports, list):
+            reports = self._extremize_reports(reports)
             summary = self._validator.summary()
             if summary:
-                logger.info(f"[{BOT_NAME}] Validation summary:\n{json.dumps(summary, indent=2)}")
+                logger.info(f"[Joypraise] Validation summary:\n{json.dumps(summary, indent=2)}")
         return reports
 
 
@@ -1192,10 +1564,12 @@ if __name__ == "__main__":
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").propagate = False
 
-    parser = argparse.ArgumentParser(description=f"Run {BOT_NAME}")
-    parser.add_argument("--mode", type=str,
-                        choices=["tournament", "metaculus_cup", "test_questions"],
-                        default="tournament")
+    parser = argparse.ArgumentParser(description="Run Joypraise – the superforecaster bot")
+    parser.add_argument(
+        "--mode", type=str,
+        choices=["tournament", "metaculus_cup", "test_questions"],
+        default="tournament",
+    )
     args     = parser.parse_args()
     run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
 
@@ -1207,30 +1581,28 @@ if __name__ == "__main__":
         calibration_target=0.15,
     )
 
-    # Main bot — standard extremization
-    bot = Bot311(
+    joypraise = Joypraise(
         client_spec=spec,
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=True,
         folder_to_save_reports_to=None,
-        skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=False,  # metadata disabled
+        skip_previously_forecasted_questions=False,
+        extra_metadata_in_explanation=False,
     )
 
-    # Minibench bot — higher extremization factor, separate instance
-    minibench_bot = Bot311(
+    minibench_joypraise = Joypraise(
         client_spec=spec,
         research_reports_per_question=1,
         predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
-        publish_reports_to_metaculus=True,
+        publish_reports_to_metaculus=False,
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
-        extra_metadata_in_explanation=False,  # metadata disabled
+        extra_metadata_in_explanation=False,
     )
-    minibench_bot._ext_cfg = ExtremizationConfig(
+    minibench_joypraise._ext_cfg = ExtremizationConfig(
         enabled=True,
         factor=4.3,
         floor=0.02,
@@ -1240,14 +1612,15 @@ if __name__ == "__main__":
     client = MetaculusClient()
 
     if run_mode == "tournament":
-        r1 = asyncio.run(bot.forecast_on_tournament("33022",                               return_exceptions=True))
-        r2 = asyncio.run(minibench_bot.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
-        r3 = asyncio.run(bot.forecast_on_tournament("market-pulse-26q2",                   return_exceptions=True))
+        r1 = asyncio.run(joypraise.forecast_on_tournament("33022", return_exceptions=True))
+        r2 = asyncio.run(minibench_joypraise.forecast_on_tournament(client.CURRENT_MINIBENCH_ID, return_exceptions=True))
+        r3 = asyncio.run(joypraise.forecast_on_tournament("market-pulse-26q2",                   return_exceptions=True))
         forecast_reports = r1 + r2 + r3
 
     elif run_mode == "metaculus_cup":
+        joypraise.skip_previously_forecasted_questions = True
         forecast_reports = asyncio.run(
-            bot.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
+            joypraise.forecast_on_tournament(client.CURRENT_METACULUS_CUP_ID, return_exceptions=True)
         )
 
     elif run_mode == "test_questions":
@@ -1257,10 +1630,10 @@ if __name__ == "__main__":
             "https://www.metaculus.com/questions/22427/number-of-new-leading-ai-labs/",
             "https://www.metaculus.com/c/diffusion-community/38880/how-many-us-labor-strikes-due-to-ai-in-2029/",
         ]
-        bot.skip_previously_forecasted_questions = True
+        joypraise.skip_previously_forecasted_questions = True
         questions        = [client.get_question_by_url(u) for u in EXAMPLE_QUESTIONS]
         forecast_reports = asyncio.run(
-            bot.forecast_questions(questions, return_exceptions=True)
+            joypraise.forecast_questions(questions, return_exceptions=True)
         )
 
-    bot.log_report_summary(forecast_reports)
+    joypraise.log_report_summary(forecast_reports)
